@@ -27,8 +27,10 @@ ssl_ctx.verify_mode = ssl.CERT_NONE
 engine = create_async_engine(
     DATABASE_URL,
     echo=True,
-    connect_args={"ssl": ssl_ctx},
-    prepared_statement_cache_size=0,
+    connect_args={
+        "ssl": ssl_ctx,
+        "statement_cache_size": 0
+    },
 )
 
 # Async session factory
