@@ -632,7 +632,19 @@ HTML_TEMPLATE = """
                     <td class="col-category" style="font-size: 9pt; color: #4A5568; vertical-align: top;">
                         {{ qi.category_name }}
                     </td>
-                    <td class="col-qty text-center" style="vertical-align: top;">{{ qi.qty }}</td>
+                    <td class="col-qty text-center" style="vertical-align: top;">
+                        {{ qi.qty }}
+                        {% if qi.pricing_type == 'sq_ft' %}
+                        <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
+                            {% set sec_dim = qi.height if (qi.height and qi.height > 0) else (qi.breadth if (qi.breadth and qi.breadth > 0) else 1.0) %}
+                            ({{ qi.length or 1 }}x{{ sec_dim or 1 }} ft)
+                        </span>
+                        {% elif qi.pricing_type == 'running_ft' %}
+                        <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
+                            ({{ qi.length or 1 }} ft)
+                        </span>
+                        {% endif %}
+                    </td>
                     <td class="col-rate text-right" style="vertical-align: top;">₹{{ "{:,.2f}".format(qi.total_amount) }}</td>
                 </tr>
                 {% endfor %}

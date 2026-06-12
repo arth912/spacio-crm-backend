@@ -126,6 +126,11 @@ class QuotationItem(Base):
     qty = Column(Float, nullable=False)
     remark = Column(Text, nullable=True)
     
+    length = Column(Float, default=1.0, nullable=True)
+    breadth = Column(Float, default=1.0, nullable=True)
+    height = Column(Float, default=1.0, nullable=True)
+    pricing_type = Column(String(50), default="piece", nullable=True)
+    
     # Store snapshots to ensure historically unchanged quotes
     snapshot_rate = Column(Float, nullable=False)
     snapshot_labor_cost = Column(Float, default=0.0)

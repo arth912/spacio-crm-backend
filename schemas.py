@@ -188,6 +188,10 @@ class QuotationItemCreate(BaseModel):
     margin_percent: float = Field(0.0, ge=0.0)
     gst_percent: float = Field(18.0, ge=0.0)
     remark: Optional[str] = None
+    length: Optional[float] = 1.0
+    breadth: Optional[float] = 1.0
+    height: Optional[float] = 1.0
+    pricing_type: Optional[str] = "piece"
 
 class QuotationItemResponse(BaseModel):
     id: str
@@ -198,8 +202,12 @@ class QuotationItemResponse(BaseModel):
     item_id: str
     item_name: Optional[str] = None
     item_brand: Optional[str] = None
+    pricing_type: Optional[str] = None
     qty: float
     remark: Optional[str] = None
+    length: Optional[float] = 1.0
+    breadth: Optional[float] = 1.0
+    height: Optional[float] = 1.0
     snapshot_rate: float
     snapshot_labor_cost: float
     snapshot_margin: float

@@ -813,13 +813,20 @@ async def create_quotation(
         if not master_item:
             raise HTTPException(status_code=404, detail=f"Master item ID {item_in.item_id} not found in catalog")
             
+        # Determine the pricing type (use the user-overridden one if provided, otherwise the master item's one)
+        ptype = item_in.pricing_type if (item_in.pricing_type is not None and item_in.pricing_type != "") else master_item.pricing_type
+
         # Run calculation
         pricing_breakdown = calculate_item_price(
             base_rate=master_item.base_rate,
             qty=item_in.qty,
             labor_cost=master_item.labor_cost,
             margin_percent=item_in.margin_percent,
-            gst_percent=item_in.gst_percent
+            gst_percent=item_in.gst_percent,
+            pricing_type=ptype,
+            length=item_in.length if item_in.length is not None else 1.0,
+            breadth=item_in.breadth if item_in.breadth is not None else 1.0,
+            height=item_in.height if item_in.height is not None else 1.0
         )
         
         # Save snapshot detail
@@ -832,6 +839,10 @@ async def create_quotation(
             item_id=item_in.item_id,
             qty=item_in.qty,
             remark=item_in.remark,
+            length=item_in.length if item_in.length is not None else 1.0,
+            breadth=item_in.breadth if item_in.breadth is not None else 1.0,
+            height=item_in.height if item_in.height is not None else 1.0,
+            pricing_type=ptype,
             snapshot_rate=master_item.base_rate,
             snapshot_labor_cost=master_item.labor_cost,
             snapshot_margin=item_in.margin_percent,
@@ -892,7 +903,8 @@ async def get_quotation_details(quotation_id: str, db: AsyncSession) -> schemas.
             models.Item.name.label("item_name"),
             models.Item.brand.label("item_brand"),
             models.Item.material.label("item_material"),
-            models.Item.dimensions.label("item_dimensions")
+            models.Item.dimensions.label("item_dimensions"),
+            models.Item.pricing_type.label("item_pricing_type")
         )
         .join(models.Room, models.QuotationItem.room_id == models.Room.id)
         .join(models.Category, models.QuotationItem.category_id == models.Category.id)
@@ -902,7 +914,8 @@ async def get_quotation_details(quotation_id: str, db: AsyncSession) -> schemas.
     
     items_out = []
     for row in items_res.all():
-        qi, room_name, cat_name, item_name, item_brand, material, dims = row
+        qi, room_name, cat_name, item_name, item_brand, material, dims, item_pricing_type = row
+        mapped_pricing_type = qi.pricing_type if (qi.pricing_type is not None and qi.pricing_type != "") else item_pricing_type
         items_out.append(
             schemas.QuotationItemResponse(
                 id=qi.id,
@@ -913,8 +926,12 @@ async def get_quotation_details(quotation_id: str, db: AsyncSession) -> schemas.
                 item_id=qi.item_id,
                 item_name=item_name,
                 item_brand=item_brand,
+                pricing_type=mapped_pricing_type,
                 qty=qi.qty,
                 remark=qi.remark,
+                length=qi.length,
+                breadth=qi.breadth,
+                height=qi.height,
                 snapshot_rate=qi.snapshot_rate,
                 snapshot_labor_cost=qi.snapshot_labor_cost,
                 snapshot_margin=qi.snapshot_margin,
