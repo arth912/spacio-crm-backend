@@ -20,6 +20,13 @@ class User(Base):
     access_end = Column(DateTime(timezone=False), nullable=True)
     payment_status = Column(String(50), default="unpaid", nullable=False)
     selected_plan = Column(String(50), default="monthly", nullable=False)
+    
+    # Email Verification & Password Reset fields
+    is_email_verified = Column(Boolean, default=False, nullable=False)
+    email_verification_token = Column(String(50), nullable=True)
+    email_verification_expires_at = Column(DateTime, nullable=True)
+    reset_token = Column(String(50), nullable=True)
+    reset_token_expires_at = Column(DateTime, nullable=True)
 
 
     subscription_payments = relationship(

@@ -37,11 +37,12 @@ if sys.platform == 'darwin':
         print(f"Failed to patch cffi dlopen: {e}")
 
 import uuid
+import random
 from datetime import datetime, timedelta
 from typing import List, Optional
 import jwt
 import bcrypt
-from fastapi import FastAPI, Depends, HTTPException, status, Response, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Response, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +57,9 @@ from pdf_generator import generate_quotation_pdf
 import razorpay
 import hmac
 import hashlib
+
+# Import email utils
+from email_utils import send_email, get_verification_html, get_reset_password_html
 
 # Razorpay Constants
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
@@ -141,57 +145,67 @@ async def get_user_id_from_request(
 
 # --- AUTH ENDPOINTS ---
 @app.post("/api/v1/auth/register", response_model=schemas.RegisterResponse)
-async def register(user_data: schemas.UserRegister, db: AsyncSession = Depends(get_db)):
+async def register(user_data: schemas.UserRegister, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     # Check if email is already taken
     result = await db.execute(select(models.User).where(models.User.email == user_data.email))
-    if result.scalars().first():
-        raise HTTPException(status_code=400, detail="Email is already registered")
-        
+    existing_user = result.scalars().first()
+    
     hashed = hash_password(user_data.password)
-    user_id = str(uuid.uuid4())
+    code = f"{random.randint(100000, 999999)}"
+    expires = datetime.utcnow() + timedelta(minutes=15)
     
-    # Calculate amount in paise
-    amount = 49900 if user_data.selected_plan == "monthly" else 499900
-    
-    # Create Razorpay Order
-    if not razor_client:
-        raise HTTPException(
-            status_code=500,
-            detail="Razorpay payment gateway is not configured on the server. Please contact an administrator."
+    if existing_user:
+        if existing_user.is_email_verified:
+            raise HTTPException(status_code=400, detail="Email is already registered")
+        else:
+            # Overwrite unverified user details to retry signup
+            existing_user.name = user_data.name
+            existing_user.password_hash = hashed
+            existing_user.phone = user_data.phone
+            existing_user.company_logo = user_data.company_logo
+            existing_user.selected_plan = user_data.selected_plan
+            existing_user.email_verification_token = code
+            existing_user.email_verification_expires_at = expires
+            db.add(existing_user)
+            user_to_send = existing_user
+    else:
+        user_id = str(uuid.uuid4())
+        new_user = models.User(
+            id=user_id,
+            name=user_data.name,
+            email=user_data.email,
+            password_hash=hashed,
+            role=user_data.role,
+            phone=user_data.phone,
+            company_logo=user_data.company_logo,
+            is_approved=False,
+            created_at=datetime.utcnow(),
+            payment_status="unpaid",
+            selected_plan=user_data.selected_plan,
+            is_email_verified=False,
+            email_verification_token=code,
+            email_verification_expires_at=expires
         )
-    try:
-        order_data = {
-            "amount": amount,
-            "currency": "INR",
-            "receipt": user_id
-        }
-        order = razor_client.order.create(data=order_data)
-        razorpay_order_id = order.get("id")
-    except Exception as e:
-        print(f"Razorpay Order creation error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create payment order with Razorpay. Please try again."
-        )
+        db.add(new_user)
+        user_to_send = new_user
 
-    transient_user = models.User(
-        id=user_id,
-        name=user_data.name,
-        email=user_data.email,
-        password_hash=hashed,
-        role=user_data.role,
-        phone=user_data.phone,
-        company_logo=user_data.company_logo,
-        is_approved=False,
-        created_at=datetime.utcnow(),
-        payment_status="unpaid",
-        selected_plan=user_data.selected_plan
+    await db.commit()
+    await db.refresh(user_to_send)
+    
+    # Send verification email in background
+    background_tasks.add_task(
+        send_email,
+        user_to_send.email,
+        "Verify Your Email Address — SpaceIO CRM",
+        get_verification_html(code)
     )
     
+    amount = 49900 if user_data.selected_plan == "monthly" else 499900
+    
     return {
-        "message": "Registration successful! Please complete your subscription payment.",
-        "user": transient_user,
-        "razorpay_order_id": razorpay_order_id,
+        "message": "Registration successful! A verification code has been sent to your email.",
+        "user": user_to_send,
+        "razorpay_order_id": None,
         "razorpay_key_id": RAZORPAY_KEY_ID,
         "amount": amount,
         "currency": "INR"
@@ -204,6 +218,12 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
     user = result.scalars().first()
     if not user or not verify_password(credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+    if not user.is_email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail="email_unverified"
+        )
         
     if user.payment_status == "unpaid" and user.role != "Admin":
         amount = 49900 if user.selected_plan == "monthly" else 499900
@@ -263,6 +283,59 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
         "user": user
     }
 
+@app.post("/api/v1/auth/verify-email")
+async def verify_email(payload: schemas.EmailVerifyRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(models.User).where(models.User.email == payload.email))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User registration record not found.")
+        
+    if not user.is_email_verified:
+        if not user.email_verification_token or user.email_verification_token != payload.code:
+            raise HTTPException(status_code=400, detail="Invalid verification code.")
+            
+        if not user.email_verification_expires_at or user.email_verification_expires_at < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Verification code has expired. Please register again.")
+            
+        user.is_email_verified = True
+        user.email_verification_token = None
+        user.email_verification_expires_at = None
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        
+    # Generate Razorpay Order details for the frontend
+    amount = 49900 if user.selected_plan == "monthly" else 499900
+    
+    if not razor_client:
+        raise HTTPException(
+            status_code=500,
+            detail="Razorpay payment gateway is not configured on the server. Please contact an administrator."
+        )
+    try:
+        order_data = {
+            "amount": amount,
+            "currency": "INR",
+            "receipt": user.id
+        }
+        order = razor_client.order.create(data=order_data)
+        razorpay_order_id = order.get("id")
+    except Exception as e:
+        print(f"Razorpay Order creation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create payment order with Razorpay. Please try again."
+        )
+        
+    return {
+        "message": "Email verified successfully! Please complete your subscription payment.",
+        "user_id": user.id,
+        "razorpay_order_id": razorpay_order_id,
+        "razorpay_key_id": RAZORPAY_KEY_ID,
+        "amount": amount,
+        "currency": "INR"
+    }
+
 @app.post("/api/v1/auth/verify-payment", response_model=schemas.TokenResponse)
 async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession = Depends(get_db)):
     signature_valid = False
@@ -284,18 +357,23 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
         
     now = datetime.utcnow()
     
-    if payload.email:
-        # Check if email is already taken
+    # Check if user already exists
+    user = None
+    if payload.user_id:
+        result = await db.execute(select(models.User).where(models.User.id == payload.user_id))
+        user = result.scalars().first()
+    if not user and payload.email:
         result = await db.execute(select(models.User).where(models.User.email == payload.email))
-        if result.scalars().first():
-            raise HTTPException(status_code=400, detail="Email is already registered")
-            
-        hashed = hash_password(payload.password)
-        access_end = now + timedelta(days=30) if payload.selected_plan == "monthly" else now + timedelta(days=365)
+        user = result.scalars().first()
         
+    if not user:
+        # Fallback creation
+        user_id = payload.user_id or str(uuid.uuid4())
+        hashed = hash_password(payload.password) if payload.password else ""
+        access_end = now + timedelta(days=30) if payload.selected_plan == "monthly" else now + timedelta(days=365)
         user = models.User(
-            id=payload.user_id,
-            name=payload.name,
+            id=user_id,
+            name=payload.name or "User",
             email=payload.email,
             password_hash=hashed,
             role="Designer",
@@ -303,21 +381,28 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
             company_logo=payload.company_logo,
             is_approved=True,
             payment_status="paid",
-            selected_plan=payload.selected_plan,
+            selected_plan=payload.selected_plan or "monthly",
             access_start=now,
-            access_end=access_end
+            access_end=access_end,
+            is_email_verified=True
         )
         db.add(user)
     else:
-        result = await db.execute(select(models.User).where(models.User.id == payload.user_id))
-        user = result.scalars().first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-            
+        # Update existing verified user details
         user.payment_status = "paid"
         user.is_approved = True
+        user.is_email_verified = True # Ensure email verified
         user.access_start = now
         
+        if payload.name:
+            user.name = payload.name
+        if payload.phone:
+            user.phone = payload.phone
+        if payload.company_logo:
+            user.company_logo = payload.company_logo
+        if payload.selected_plan:
+            user.selected_plan = payload.selected_plan
+            
         if user.selected_plan == "monthly":
             user.access_end = now + timedelta(days=30)
         else:
@@ -346,6 +431,51 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
         "token_type": "bearer",
         "user": user
     }
+
+@app.post("/api/v1/auth/forgot-password")
+async def forgot_password(payload: schemas.PasswordResetRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(models.User).where(models.User.email == payload.email))
+    user = result.scalars().first()
+    
+    if user:
+        code = f"{random.randint(100000, 999999)}"
+        user.reset_token = code
+        user.reset_token_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        db.add(user)
+        await db.commit()
+        
+        background_tasks.add_task(
+            send_email,
+            user.email,
+            "Password Reset Code — SpaceIO CRM",
+            get_reset_password_html(code)
+        )
+        
+        return {"message": "If the email is registered, a password reset code has been sent."}
+        
+    return {"message": "If the email is registered, a password reset code has been sent."}
+
+@app.post("/api/v1/auth/reset-password")
+async def reset_password(payload: schemas.PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(models.User).where(models.User.email == payload.email))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+        
+    if not user.reset_token or user.reset_token != payload.token:
+        raise HTTPException(status_code=400, detail="Invalid or incorrect reset code.")
+        
+    if not user.reset_token_expires_at or user.reset_token_expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
+        
+    hashed = hash_password(payload.new_password)
+    user.password_hash = hashed
+    user.reset_token = None
+    user.reset_token_expires_at = None
+    db.add(user)
+    await db.commit()
+    
+    return {"message": "Password has been reset successfully. You can now sign in."}
 
 
 
@@ -575,6 +705,36 @@ async def get_client(
     client = result.scalars().first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
+    return client
+
+
+@app.put("/api/v1/clients/{client_id}", response_model=schemas.ClientResponse)
+async def update_client(
+    client_id: str,
+    client_data: schemas.ClientUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: Optional[str] = Depends(get_user_id_from_request)
+):
+    query = select(models.Client).where(models.Client.id == client_id)
+    if current_user_id:
+        query = query.where(models.Client.user_id == current_user_id)
+    result = await db.execute(query)
+    client = result.scalars().first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+        
+    if client_data.name is not None:
+        client.name = client_data.name
+    if client_data.phone is not None:
+        client.phone = client_data.phone
+    if client_data.email is not None:
+        client.email = client_data.email
+    if client_data.address is not None:
+        client.address = client_data.address
+        
+    db.add(client)
+    await db.commit()
+    await db.refresh(client)
     return client
 
 

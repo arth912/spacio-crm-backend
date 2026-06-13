@@ -89,6 +89,12 @@ class ClientCreate(BaseModel):
     email: Optional[str] = None
     address: Optional[str] = None
 
+class ClientUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
+
 class ClientResponse(BaseModel):
     id: str
     user_id: Optional[str] = None
@@ -290,3 +296,18 @@ class SubscriptionPaymentResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# --- PASSWORD RESET & EMAIL VERIFICATION SCHEMAS ---
+class EmailVerifyRequest(BaseModel):
+    email: EmailStr
+    code: str
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    email: EmailStr
+    token: str
+    new_password: str = Field(..., min_length=6)
+
