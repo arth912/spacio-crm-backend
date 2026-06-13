@@ -3,7 +3,7 @@ def calculate_item_price(
     qty: float, 
     labor_cost: float = 0.0, 
     margin_percent: float = 0.0, 
-    gst_percent: float = 18.0,
+    gst_percent: float = 0.0,
     pricing_type: str = "piece",
     length: float = 1.0,
     breadth: float = 1.0,
@@ -21,11 +21,11 @@ def calculate_item_price(
     unit_cost_before_margin = base_rate + labor_cost
     
     # 2. Add profit margin
-    margin_multiplier = 1.0 + (margin_percent / 100.0)
+    margin_multiplier = 1.0 + (margin_percent / 100.0) if margin_percent > 0.0 else 1.0
     unit_price_after_margin = unit_cost_before_margin * margin_multiplier
     
     # 3. Add GST
-    gst_multiplier = 1.0 + (gst_percent / 100.0)
+    gst_multiplier = 1.0 + (gst_percent / 100.0) if gst_percent > 0.0 else 1.0
     final_unit_price = unit_price_after_margin * gst_multiplier
     
     # Calculate multiplier based on pricing type
@@ -43,12 +43,13 @@ def calculate_item_price(
     else:
         multiplier = qty
 
+    # GST-inclusive total amount
     total_amount = final_unit_price * multiplier
     
     # Pre-tax subtotal (without GST)
     subtotal_item_total = unit_price_after_margin * multiplier
     
-    # GST contribution
+    # GST contribution (item-wise)
     gst_amount = total_amount - subtotal_item_total
     
     return {
@@ -57,5 +58,5 @@ def calculate_item_price(
         "final_unit_price": round(final_unit_price, 2),
         "total_amount": round(total_amount, 2),
         "gst_amount": round(gst_amount, 2),
-        "subtotal": round(subtotal_item_total, 2)
+        "subtotal": round(total_amount, 2)
     }

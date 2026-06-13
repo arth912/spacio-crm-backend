@@ -7,12 +7,14 @@ from sqlalchemy.orm import declarative_base
 # Load environment variables from .env file
 load_dotenv()
 
-# Use Supabase PostgreSQL database (direct or pooler URL)
-DATABASE_URL = os.getenv("supabase_url")
+# Try supabase_pooler_url first (since direct URL might use IPv6 which fails on some networks), then fallback to supabase_url
+DATABASE_URL = os.getenv("supabase_pooler_url")
+if not DATABASE_URL:
+    DATABASE_URL = os.getenv("supabase_url")
 if not DATABASE_URL:
     DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise ValueError("supabase_url environment variable is not set. Please check your .env file.")
+    raise ValueError("Neither supabase_pooler_url nor supabase_url environment variable is set. Please check your .env file.")
 
 # Translate protocol prefix for asyncpg driver compatibility
 if DATABASE_URL.startswith("postgresql://"):

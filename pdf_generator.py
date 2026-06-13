@@ -633,15 +633,16 @@ HTML_TEMPLATE = """
                         {{ qi.category_name }}
                     </td>
                     <td class="col-qty text-center" style="vertical-align: top;">
-                        {{ qi.qty }}
+                        {{ qi.qty }} {% if qi.qty == 1 %}pc{% else %}pcs{% endif %}
                         {% if qi.pricing_type == 'sq_ft' %}
+                        {% set sec_dim = qi.height if (qi.height and qi.height > 0) else (qi.breadth if (qi.breadth and qi.breadth > 0) else 1.0) %}
+                        {% set area = (qi.length or 1.0) * sec_dim %}
                         <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
-                            {% set sec_dim = qi.height if (qi.height and qi.height > 0) else (qi.breadth if (qi.breadth and qi.breadth > 0) else 1.0) %}
-                            ({{ qi.length or 1 }}x{{ sec_dim or 1 }} ft)
+                            {{ "{:g}".format(area) }} sq_ft
                         </span>
                         {% elif qi.pricing_type == 'running_ft' %}
                         <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
-                            ({{ qi.length or 1 }} ft)
+                            {{ "{:g}".format(qi.length or 1.0) }} ft
                         </span>
                         {% endif %}
                     </td>
@@ -658,17 +659,17 @@ HTML_TEMPLATE = """
     <div class="summary-wrapper" style="clear: both; overflow: auto; width: 100%;">
         <table class="summary-table" style="width: 350px; margin-left: auto; margin-right: 0;">
             <tr>
-                <td class="summary-label">Quotation Subtotal:</td>
-                <td class="text-right">₹{{ "{:,.2f}".format(quotation.subtotal) }}</td>
+                <td class="summary-label">Total Item Price:</td>
+                <td class="text-right" style="color: #1e293b; font-weight: 700;">₹{{ "{:,.2f}".format(quotation.subtotal) }}</td>
             </tr>
             <tr>
-                <td class="summary-label">GST / Taxes:</td>
-                <td class="text-right">₹{{ "{:,.2f}".format(quotation.gst_amount) }}</td>
+                <td class="summary-label">Additional GST / Taxes:</td>
+                <td class="text-right" style="color: #1e293b; font-weight: 500;">₹{{ "{:,.2f}".format(quotation.gst_amount) }}</td>
             </tr>
             {% if quotation.discount_amount > 0 %}
             <tr>
-                <td class="summary-label" style="color: #E53E3E;">Discount Applied:</td>
-                <td class="text-right" style="color: #E53E3E;">-₹{{ "{:,.2f}".format(quotation.discount_amount) }}</td>
+                <td class="summary-label" style="color: #E53E3E; border-top: 1px solid #e2e8f0; padding-top: 10px;">Discount Applied:</td>
+                <td class="text-right" style="color: #E53E3E; border-top: 1px solid #e2e8f0; padding-top: 10px;">-₹{{ "{:,.2f}".format(quotation.discount_amount) }}</td>
             </tr>
             {% endif %}
             <tr class="grand-total-row">
@@ -724,11 +725,21 @@ def generate_quotation_html(quotation_dict: dict, weasyprint_failed: bool = Fals
     """
     # Group item entries room-wise for cleaner presentation
     rooms_grouped = {}
+    total_excl_gst = 0.0
+    total_item_gst = 0.0
     for qi in quotation_dict.get("items", []):
         room_id = qi["room_id"]
         if room_id not in rooms_grouped:
             rooms_grouped[room_id] = []
         rooms_grouped[room_id].append(qi)
+        
+        # Calculate pre-tax price and GST contribution for each item
+        total_amt = qi.get("total_amount", 0.0)
+        gst_percent = qi.get("snapshot_gst_percent", 0.0)
+        pre_tax = total_amt / (1.0 + (gst_percent / 100.0))
+        item_gst = total_amt - pre_tax
+        total_excl_gst += pre_tax
+        total_item_gst += item_gst
         
     date_str = datetime.now().strftime("%B %d, %Y")
     
@@ -738,7 +749,9 @@ def generate_quotation_html(quotation_dict: dict, weasyprint_failed: bool = Fals
         quotation=quotation_dict,
         rooms_grouped=rooms_grouped,
         date_str=date_str,
-        weasyprint_failed=weasyprint_failed
+        weasyprint_failed=weasyprint_failed,
+        total_excl_gst=total_excl_gst,
+        total_item_gst=total_item_gst
     )
     return html_content
 

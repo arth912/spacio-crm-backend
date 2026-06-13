@@ -191,7 +191,9 @@ class QuotationItemCreate(BaseModel):
     length: Optional[float] = 1.0
     breadth: Optional[float] = 1.0
     height: Optional[float] = 1.0
-    pricing_type: Optional[str] = "piece"
+    pricing_type: Optional[str] = None
+    base_rate: Optional[float] = None
+    labor_cost: Optional[float] = None
 
 class QuotationItemResponse(BaseModel):
     id: str
@@ -225,6 +227,8 @@ class QuotationCreate(BaseModel):
     discount_amount: float = Field(0.0, ge=0.0)
     terms_conditions: Optional[str] = None
     items: List[QuotationItemCreate]
+    apply_global_gst: Optional[bool] = False
+    global_gst_percent: Optional[float] = 0.0
 
 class QuotationResponse(BaseModel):
     id: str

@@ -816,11 +816,15 @@ async def create_quotation(
         # Determine the pricing type (use the user-overridden one if provided, otherwise the master item's one)
         ptype = item_in.pricing_type if (item_in.pricing_type is not None and item_in.pricing_type != "") else master_item.pricing_type
 
+        # Determine the base rate and labor cost (use user overrides if provided, else catalog defaults)
+        brate = item_in.base_rate if item_in.base_rate is not None else master_item.base_rate
+        lcost = item_in.labor_cost if item_in.labor_cost is not None else master_item.labor_cost
+
         # Run calculation
         pricing_breakdown = calculate_item_price(
-            base_rate=master_item.base_rate,
+            base_rate=brate,
             qty=item_in.qty,
-            labor_cost=master_item.labor_cost,
+            labor_cost=lcost,
             margin_percent=item_in.margin_percent,
             gst_percent=item_in.gst_percent,
             pricing_type=ptype,
@@ -843,8 +847,8 @@ async def create_quotation(
             breadth=item_in.breadth if item_in.breadth is not None else 1.0,
             height=item_in.height if item_in.height is not None else 1.0,
             pricing_type=ptype,
-            snapshot_rate=master_item.base_rate,
-            snapshot_labor_cost=master_item.labor_cost,
+            snapshot_rate=brate,
+            snapshot_labor_cost=lcost,
             snapshot_margin=item_in.margin_percent,
             snapshot_gst_percent=item_in.gst_percent,
             final_price=pricing_breakdown["final_unit_price"],
@@ -852,17 +856,20 @@ async def create_quotation(
         )
         db.add(new_q_item)
         
-        # Accumulate aggregates
-        subtotal_aggregate += pricing_breakdown["subtotal"]
-        gst_aggregate += pricing_breakdown["gst_amount"]
+        # Accumulate aggregates (subtotal is GST-inclusive total_amount of the items)
+        subtotal_aggregate += pricing_breakdown["total_amount"]
         
-    # 5. Apply final aggregates and discount
-    grand_total = subtotal_aggregate + gst_aggregate - q_data.discount_amount
+    # 5. Apply additional global GST on final subtotal (sum of items including item-wise GST)
+    global_gst = 0.0
+    if q_data.apply_global_gst and q_data.global_gst_percent:
+        global_gst = subtotal_aggregate * (q_data.global_gst_percent / 100.0)
+        
+    grand_total = subtotal_aggregate + global_gst - q_data.discount_amount
     if grand_total < 0:
         grand_total = 0.0
         
     new_quote.subtotal = round(subtotal_aggregate, 2)
-    new_quote.gst_amount = round(gst_aggregate, 2)
+    new_quote.gst_amount = round(global_gst, 2)
     new_quote.grand_total = round(grand_total, 2)
     
     db.add(new_quote)
