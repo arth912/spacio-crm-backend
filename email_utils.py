@@ -13,10 +13,15 @@ load_dotenv()
 
 # Load environment configurations
 SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", ""))
+smtp_port_raw = os.getenv("SMTP_PORT", "")
+try:
+    SMTP_PORT = int(smtp_port_raw) if smtp_port_raw else 587
+except ValueError:
+    SMTP_PORT = 587
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "")
+
 
 def get_verification_html(otp_code: str) -> str:
     """

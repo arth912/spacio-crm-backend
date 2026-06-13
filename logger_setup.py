@@ -37,7 +37,7 @@ def setup_logging():
     root_logger.addHandler(app_handler)
     root_logger.addHandler(error_handler)
     
-    # 6. Configure Uvicorn & SQLAlchemy loggers to redirect to file only
+    # 6. Configure Uvicorn, SQLAlchemy, and WeasyPrint loggers to redirect to file only
     loggers_to_redirect = [
         "uvicorn",
         "uvicorn.error",
@@ -45,12 +45,20 @@ def setup_logging():
         "sqlalchemy.engine",
         "email_utils",
         "pdf_generator",
-        "main"
+        "main",
+        "weasyprint",
+        "weasyprint.progress",
+        "fontconfig"
     ]
     
     for logger_name in loggers_to_redirect:
         logger = logging.getLogger(logger_name)
-        logger.setLevel(logging.INFO)
+        # Suppress verbose info progress statements from weasyprint and fontconfig
+        if "weasyprint" in logger_name or logger_name == "fontconfig":
+            logger.setLevel(logging.WARNING)
+        else:
+            logger.setLevel(logging.INFO)
+            
         logger.propagate = False  # Avoid duplicating logs in the root logger
         
         # Clear existing handlers (especially console StreamHandlers)
@@ -60,6 +68,7 @@ def setup_logging():
         # Add our file-based handlers
         logger.addHandler(app_handler)
         logger.addHandler(error_handler)
+
 
 # Run setup on import
 setup_logging()
