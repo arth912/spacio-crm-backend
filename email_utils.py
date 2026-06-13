@@ -1,9 +1,12 @@
 import os
 import re
 import smtplib
+import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load environment configurations from .env file
 load_dotenv()
@@ -287,17 +290,20 @@ async def send_email(to_email: str, subject: str, body_html: str):
     If no SMTP_PASSWORD is set, it outputs the email content to stdout for testing.
     """
     if not SMTP_PASSWORD:
-        print("=" * 70)
-        print(f"✉️ [SMTP SIMULATOR] Outgoing Email Triggered:")
-        print(f"   To:      {to_email}")
-        print(f"   From:    {SMTP_FROM}")
-        print(f"   Subject: {subject}")
+        msg_parts = [
+            "=" * 70,
+            "✉️ [SMTP SIMULATOR] Outgoing Email Triggered:",
+            f"   To:      {to_email}",
+            f"   From:    {SMTP_FROM}",
+            f"   Subject: {subject}"
+        ]
         # Extract code from template if possible for clear visibility
         otp_match = re.search(r'class="otp-code"[^>]*>\s*(\d{6})\s*<', body_html)
         if otp_match:
-            print(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
-        print(f"   HTML Body Preview (150 chars): {body_html.strip()[:150]}...")
-        print("=" * 70)
+            msg_parts.append(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
+        msg_parts.append(f"   HTML Body Preview (150 chars): {body_html.strip()[:150]}...")
+        msg_parts.append("=" * 70)
+        logger.info("\n".join(msg_parts))
         return
 
     # Create message container
@@ -322,15 +328,18 @@ async def send_email(to_email: str, subject: str, body_html: str):
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_FROM, to_email, msg.as_string())
         server.quit()
-        print(f"Successfully sent email to {to_email} via SMTP.")
+        logger.info(f"Successfully sent email to {to_email} via SMTP.")
     except Exception as e:
-        print(f"ERROR: Failed to send email to {to_email} via SMTP: {e}")
+        logger.error(f"Failed to send email to {to_email} via SMTP: {e}")
         # Fall back to printing to logs so system does not completely crash
-        print("=" * 70)
-        print(f"✉️ [SMTP FALLBACK] Outgoing Email Details due to Send Error:")
-        print(f"   To:      {to_email}")
-        print(f"   Subject: {subject}")
+        msg_parts = [
+            "=" * 70,
+            "✉️ [SMTP FALLBACK] Outgoing Email Details due to Send Error:",
+            f"   To:      {to_email}",
+            f"   Subject: {subject}"
+        ]
         otp_match = re.search(r'class="otp-code"[^>]*>\s*(\d{6})\s*<', body_html)
         if otp_match:
-            print(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
-        print("=" * 70)
+            msg_parts.append(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
+        msg_parts.append("=" * 70)
+        logger.warning("\n".join(msg_parts))

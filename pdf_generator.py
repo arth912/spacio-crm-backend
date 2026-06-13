@@ -1,7 +1,10 @@
 import os
 import sys
+import logging
 from jinja2 import Template
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # Monkeypatch cffi to find macOS Homebrew dynamic libraries when running on Apple Silicon
 if sys.platform == 'darwin':
@@ -772,6 +775,6 @@ def generate_quotation_pdf(quotation_dict: dict) -> bytes:
     html_content = generate_quotation_html(quotation_dict, weasyprint_failed=False)
     
     # Render using WeasyPrint
-    print("Compiling PDF with WeasyPrint...")
+    logger.info("Compiling PDF with WeasyPrint...")
     pdf_bytes = HTML(string=html_content).write_pdf()
     return pdf_bytes

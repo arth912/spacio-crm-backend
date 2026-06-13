@@ -1,5 +1,9 @@
 import os
 import sys
+import logging
+import logger_setup
+
+logger = logging.getLogger(__name__)
 
 # Patch cffi dynamic library loader to search Homebrew paths on macOS before weasyprint is imported
 if sys.platform == 'darwin':
@@ -34,7 +38,7 @@ if sys.platform == 'darwin':
             return orig_dlopen(self, name, flags)
         cffi.FFI.dlopen = custom_dlopen
     except Exception as e:
-        print(f"Failed to patch cffi dlopen: {e}")
+        logger.error(f"Failed to patch cffi dlopen: {e}")
 
 import uuid
 import random
@@ -71,7 +75,7 @@ try:
     else:
         razor_client = None
 except Exception as e:
-    print(f"Error initializing Razorpay Client: {e}")
+    logger.error(f"Error initializing Razorpay Client: {e}")
     razor_client = None
 
 
@@ -85,6 +89,23 @@ app = FastAPI(
     description="Backend API for decoCRM - Interior Design Quotation & Billing Management",
     version="1.0.0"
 )
+
+from sqlalchemy import text
+
+@app.on_event("startup")
+async def startup_event():
+    # Clean console startup logs
+    print("=" * 50)
+    print("🚀 Server started successfully on http://127.0.0.1:8000")
+    try:
+        # Verify database connection
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        print("🔗 Database connected successfully!")
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+        logger.error(f"Database connection failed during startup: {e}")
+    print("=" * 50)
 
 # CORS Setup
 app.add_middleware(
@@ -237,7 +258,7 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
             order = razor_client.order.create(data={"amount": amount, "currency": "INR", "receipt": user.id})
             razorpay_order_id = order.get("id")
         except Exception as e:
-            print(f"Razorpay Order creation on login error: {e}")
+            logger.error(f"Razorpay Order creation on login error: {e}")
             raise HTTPException(
                 status_code=500,
                 detail="Failed to generate payment order. Please try again."
@@ -321,7 +342,7 @@ async def verify_email(payload: schemas.EmailVerifyRequest, db: AsyncSession = D
         order = razor_client.order.create(data=order_data)
         razorpay_order_id = order.get("id")
     except Exception as e:
-        print(f"Razorpay Order creation error: {e}")
+        logger.error(f"Razorpay Order creation error: {e}")
         raise HTTPException(
             status_code=500,
             detail="Failed to create payment order with Razorpay. Please try again."
@@ -350,7 +371,7 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
             razor_client.utility.verify_payment_signature(params_dict)
             signature_valid = True
         except Exception as e:
-            print(f"Razorpay payment verification failed: {e}")
+            logger.error(f"Razorpay payment verification failed: {e}")
             
     if not signature_valid:
         raise HTTPException(status_code=400, detail="Invalid payment signature. Payment verification failed.")
@@ -1258,7 +1279,7 @@ async def download_quotation_pdf(
             }
         )
     except Exception as e:
-        print(f"WeasyPrint failed: {e}. Falling back to print-friendly HTML template.")
+        logger.warning(f"WeasyPrint failed: {e}. Falling back to print-friendly HTML template.")
         from fastapi.responses import HTMLResponse
         from pdf_generator import generate_quotation_html
         html_content = generate_quotation_html(q_dict, weasyprint_failed=True)
