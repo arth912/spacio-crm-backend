@@ -63,7 +63,7 @@ import hmac
 import hashlib
 
 # Import email utils
-from email_utils import send_email, get_verification_html, get_reset_password_html
+from email_utils import send_email, get_verification_html, get_reset_password_html, get_payment_confirmation_html
 
 # Razorpay Constants
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
@@ -295,16 +295,80 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
             detail=f"Your account access period has not started yet (scheduled for {user.access_start})."
         )
     if user.access_end is not None and now > user.access_end:
-        raise HTTPException(
-            status_code=403,
-            detail="Your account access has expired. Please contact an administrator."
-        )
+        if user.role != "Admin":
+            amount = 49900 if (user.selected_plan or "monthly") == "monthly" else 499900
+            razorpay_order_id = None
+            if razor_client:
+                try:
+                    order = razor_client.order.create(data={"amount": amount, "currency": "INR", "receipt": user.id})
+                    razorpay_order_id = order.get("id")
+                except Exception as e:
+                    logger.error(f"Razorpay Order creation on expired login error: {e}")
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "access_expired",
+                    "user_id": user.id,
+                    "email": user.email,
+                    "phone": user.phone,
+                    "name": user.name,
+                    "razorpay_order_id": razorpay_order_id,
+                    "razorpay_key_id": RAZORPAY_KEY_ID,
+                    "amount": amount,
+                    "plan": user.selected_plan or "monthly",
+                    "message": "Your account access has expired. Please select a plan and complete payment to renew access."
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Your account access has expired. Please contact an administrator."
+            )
         
     token = create_access_token({"sub": user.id, "role": user.role})
     return {
         "access_token": token,
         "token_type": "bearer",
         "user": user
+    }
+
+@app.post("/api/v1/auth/create-subscription-order")
+async def create_subscription_order(payload: schemas.CreateSubscriptionOrderRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(models.User).where(models.User.id == payload.user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+        
+    amount = 49900 if payload.selected_plan == "monthly" else 499900
+    
+    if not razor_client:
+        raise HTTPException(
+            status_code=500,
+            detail="Razorpay payment gateway is not configured on the server."
+        )
+    try:
+        order = razor_client.order.create(data={"amount": amount, "currency": "INR", "receipt": user.id})
+        razorpay_order_id = order.get("id")
+    except Exception as e:
+        logger.error(f"Razorpay Order creation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate payment order. Please try again."
+        )
+        
+    user.selected_plan = payload.selected_plan
+    db.add(user)
+    await db.commit()
+    
+    return {
+        "user_id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "phone": user.phone,
+        "razorpay_order_id": razorpay_order_id,
+        "razorpay_key_id": RAZORPAY_KEY_ID,
+        "amount": amount,
+        "plan": payload.selected_plan
     }
 
 @app.post("/api/v1/auth/verify-email")
@@ -361,7 +425,7 @@ async def verify_email(payload: schemas.EmailVerifyRequest, db: AsyncSession = D
     }
 
 @app.post("/api/v1/auth/verify-payment", response_model=schemas.TokenResponse)
-async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession = Depends(get_db)):
+async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     signature_valid = False
     
     if razor_client:
@@ -416,7 +480,6 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
         user.payment_status = "paid"
         user.is_approved = True
         user.is_email_verified = True # Ensure email verified
-        user.access_start = now
         
         if payload.name:
             user.name = payload.name
@@ -427,10 +490,14 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
         if payload.selected_plan:
             user.selected_plan = payload.selected_plan
             
+        # Check if user access was expired or current
+        start_date = user.access_end if (user.access_end and user.access_end > now) else now
+        user.access_start = now
+        
         if user.selected_plan == "monthly":
-            user.access_end = now + timedelta(days=30)
+            user.access_end = start_date + timedelta(days=30)
         else:
-            user.access_end = now + timedelta(days=365)
+            user.access_end = start_date + timedelta(days=365)
             
         db.add(user)
         
@@ -448,6 +515,27 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, db: AsyncSession
     db.add(sub_payment)
     await db.commit()
     await db.refresh(user)
+    
+    # Trigger payment confirmation & plan details email in background
+    try:
+        access_end_str = user.access_end.strftime("%d %B %Y") if user.access_end else "N/A"
+        paid_amount = 499.0 if user.selected_plan == "monthly" else 4999.0
+        email_html = get_payment_confirmation_html(
+            user_name=user.name,
+            plan=user.selected_plan,
+            amount=paid_amount,
+            payment_id=payload.razorpay_payment_id,
+            order_id=payload.razorpay_order_id,
+            access_end_str=access_end_str
+        )
+        background_tasks.add_task(
+            send_email,
+            user.email,
+            f"Payment Confirmation & Subscription Active - SpaceIO CRM ({user.selected_plan.capitalize()} Plan)",
+            email_html
+        )
+    except Exception as email_err:
+        logger.error(f"Error scheduling payment confirmation email: {email_err}")
     
     token = create_access_token({"sub": user.id, "role": user.role})
     return {

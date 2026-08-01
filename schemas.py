@@ -43,6 +43,11 @@ class RegisterResponse(BaseModel):
     amount: Optional[int] = None
     currency: Optional[str] = None
 
+class CreateSubscriptionOrderRequest(BaseModel):
+    user_id: str
+    selected_plan: str = Field("monthly", pattern="^(monthly|yearly)$")
+
+
 class PaymentVerifyRequest(BaseModel):
     user_id: str
     razorpay_payment_id: str
