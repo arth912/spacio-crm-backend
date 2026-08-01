@@ -104,6 +104,9 @@ async def startup_event():
         print("🔗 Database connected successfully!")
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
+        if "101" in str(e) or "unreachable" in str(e).lower():
+            print("💡 HINT: 'Network is unreachable' usually occurs when connecting to a Supabase Direct URL (db.xxx.supabase.co) over IPv6 on a server without IPv6 egress.")
+            print("👉 SOLUTION: Use the Supabase Connection Pooler URL (aws-0-xxx.pooler.supabase.com) in your .env file as 'supabase_pooler_url'.")
         logger.error(f"Database connection failed during startup: {e}")
     print("=" * 50)
 
