@@ -515,11 +515,6 @@ async def send_email(to_email: str, subject: str, body_html: str):
             f"   From:    {SMTP_FROM}",
             f"   Subject: {subject}"
         ]
-        # Extract code from template if possible for clear visibility
-        otp_match = re.search(r'class="otp-code"[^>]*>\s*(\d{6})\s*<', body_html)
-        if otp_match:
-            msg_parts.append(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
-        msg_parts.append(f"   HTML Body Preview (150 chars): {body_html.strip()[:150]}...")
         msg_parts.append("=" * 70)
         logger.info("\n".join(msg_parts))
         return
@@ -556,8 +551,5 @@ async def send_email(to_email: str, subject: str, body_html: str):
             f"   To:      {to_email}",
             f"   Subject: {subject}"
         ]
-        otp_match = re.search(r'class="otp-code"[^>]*>\s*(\d{6})\s*<', body_html)
-        if otp_match:
-            msg_parts.append(f"\n   👉 DEVELOPMENT OTP CODE: {otp_match.group(1)} 👈\n")
         msg_parts.append("=" * 70)
         logger.warning("\n".join(msg_parts))

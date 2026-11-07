@@ -1,10 +1,66 @@
+import re
 import os
 import sys
 import logging
-from jinja2 import Template
+import hashlib
+import threading
+from functools import lru_cache
+from collections import OrderedDict
+from jinja2 import Template  # noqa: F401
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+_LOGO_RE = re.compile(r"^data:image/(png|jpe?g|gif|webp);base64,([A-Za-z0-9+/=\s]+)$")
+_LOGO_INPUT_MAX = 12_000_000      # chars of data URI we are willing to decode
+_LOGO_BOX = (600, 240)            # px; plenty for a ~45px-tall print logo at high DPI
+
+
+def sanitize_logo(value):
+    if not isinstance(value, str):
+        return None
+    return _sanitize_logo_cached(value)
+
+
+@lru_cache(maxsize=8)
+def _sanitize_logo_cached(value):
+    """Return a small, safe PNG data URI for the PDF, or None.
+
+    Only inline raster data URIs are accepted (http/file URLs are never
+    fetched - SSRF). Large uploads are decoded with Pillow and downscaled
+    instead of being silently dropped; this also fixes a wrong MIME label
+    (e.g. JPEG bytes tagged image/png) and keeps the PDF small.
+    """
+    if not isinstance(value, str) or len(value) > _LOGO_INPUT_MAX:
+        return None
+    m = _LOGO_RE.match(value.strip())
+    if not m:
+        return None
+    try:
+        import base64, io
+        from PIL import Image
+
+        raw = base64.b64decode(re.sub(r"\s+", "", m.group(2)), validate=True)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if getattr(img, "is_animated", False):
+            img.seek(0)
+        img = img.convert("RGBA")
+        img.thumbnail(_LOGO_BOX, Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.warning(f"Company logo could not be processed for PDF: {e}")
+        return None
+
+def _safe_url_fetcher(url, *args, **kwargs):
+    """Block file://, http(s):// etc. in PDF rendering (prevents SSRF / local file read)."""
+    if url.startswith("data:"):
+        from weasyprint import default_url_fetcher
+        return default_url_fetcher(url, *args, **kwargs)
+    raise ValueError(f"External resource blocked in PDF rendering: {url[:60]}")
+
 
 # Monkeypatch cffi to find macOS Homebrew dynamic libraries when running on Apple Silicon
 if sys.platform == 'darwin':
@@ -48,733 +104,595 @@ if sys.platform == 'darwin':
     except Exception:
         pass
 
-try:
-    from weasyprint import HTML
-    WEASYPRINT_AVAILABLE = True
-except Exception as e:
-    WEASYPRINT_AVAILABLE = False
-    WEASYPRINT_ERROR = str(e)
+HTML = None
+WEASYPRINT_AVAILABLE = False
+WEASYPRINT_ERROR = ""
+
+
+def _load_weasyprint() -> bool:
+    """Import WeasyPrint on demand. A failure is NOT cached, so installing
+    pango later takes effect without restarting the server."""
+    global HTML, WEASYPRINT_AVAILABLE, WEASYPRINT_ERROR
+    if WEASYPRINT_AVAILABLE:
+        return True
+    try:
+        from weasyprint import HTML as _HTML
+        HTML, WEASYPRINT_AVAILABLE, WEASYPRINT_ERROR = _HTML, True, ""
+    except Exception as e:
+        WEASYPRINT_ERROR = str(e)
+    return WEASYPRINT_AVAILABLE
+
+
+_load_weasyprint()
+
+
+
+# --------------------------------------------------------------------------
+# Formatting helpers
+# --------------------------------------------------------------------------
+
+def _num(value, default=0.0):
+    """None/garbage-safe float."""
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _group_indian(int_part: str) -> str:
+    """12345678 -> 1,23,45,678"""
+    if len(int_part) <= 3:
+        return int_part
+    head, tail = int_part[:-3], int_part[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return ",".join(parts + [tail])
+
+
+def inr(value) -> str:
+    """Format as Indian rupees: ₹1,80,752.40 (negatives as -₹...)."""
+    n = round(_num(value), 2)
+    sign = "-" if n < 0 else ""
+    int_part, dec_part = f"{abs(n):.2f}".split(".")
+    return f"{sign}₹{_group_indian(int_part)}.{dec_part}"
+
+
+def _g(value) -> str:
+    return f"{_num(value):g}"
+
+
+def item_area(qi: dict) -> float:
+    """Same area rule as pricing.calculate_item_price (length x height, else x breadth, else x 1)."""
+    length = _num(qi.get("length"), 1.0) or 1.0
+    height = _num(qi.get("height"), 0.0)
+    breadth = _num(qi.get("breadth"), 0.0)
+    second = height if height > 0 else (breadth if breadth > 0 else 1.0)
+    return length * second
+
+
+def qty_label(qi: dict) -> str:
+    """Human readable quantity: '1 pc', '2 × 28 sq ft', '1 × 12 rft'."""
+    qty = _num(qi.get("qty"), 1.0)
+    ptype = qi.get("pricing_type")
+    if ptype == "sq_ft":
+        return f"{_g(qty)} × {_g(item_area(qi))} sq ft"
+    if ptype == "running_ft":
+        return f"{_g(qty)} × {_g(_num(qi.get('length'), 1.0) or 1.0)} rft"
+    return f"{_g(qty)} pc"
+
+
+def css_str(value) -> str:
+    """Make a value safe inside a CSS string literal (page margin-box content)."""
+    text = "" if value is None else str(value)
+    return re.sub(r'["\\\n\r{}<>]', " ", text.replace("&", "and")).strip()
+
+
+def _parse_date(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(value[:19], fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def quote_number(quotation: dict) -> str:
+    qid = quotation.get("id")
+    if not qid:
+        return "DRAFT"
+    qid = str(qid)
+    if qid.startswith("local_"):
+        return f"LQ-{qid[-6:].upper()}"
+    return f"QT-{qid[:8].upper()}"
+
+
+# --------------------------------------------------------------------------
+# Template (single source of truth)
+# --------------------------------------------------------------------------
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Quotation - {{ quotation.project_name }}</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Outfit:wght@400;500;600;700;800&display=swap');
-
-        @page {
-            size: A4;
-            margin: 30mm 20mm 20mm 20mm;
-            @top-left {
-                content: "{{ quotation.creator.name if (quotation.creator and quotation.creator.name) else 'SpaceIO' }} Proposal";
-                font-family: 'Outfit', sans-serif;
-                font-size: 8.5pt;
-                font-weight: 700;
-                color: #94a3b8;
-                text-transform: uppercase;
-                letter-spacing: 1.5px;
-                border-bottom: 1.5px solid #e2e8f0;
-                padding-top: 12mm;
-                padding-bottom: 6mm;
-                vertical-align: middle;
-            }
-            @top-right {
-                content: "";
-                background-image: url('{{ quotation.creator.company_logo if (quotation.creator and quotation.creator.company_logo) else "http://localhost:3000/spaceio_logo.png" }}');
-                background-size: auto 10mm;
-                background-repeat: no-repeat;
-                background-position: right center;
-                border-bottom: 1.5px solid #e2e8f0;
-                padding-top: 12mm;
-                padding-bottom: 6mm;
-                vertical-align: middle;
-                width: 35mm;
-            }
-            @bottom-right {
-                content: "Page " counter(page) " of " counter(pages) " • Generated by SpaceIO";
-                font-family: 'Outfit', 'Inter', sans-serif;
-                font-size: 8pt;
-                color: #94a3b8;
-            }
-            @bottom-left {
-                content: "{{ quotation.creator.name if (quotation.creator and quotation.creator.name) else 'SpaceIO' }} Proposal";
-                font-family: 'Outfit', 'Inter', sans-serif;
-                font-size: 8pt;
-                color: #94a3b8;
-            }
+<meta charset="utf-8">
+<title>Quotation - {{ quotation.project_name }}</title>
+<style>
+    @page {
+        size: A4;
+        margin: 22mm 16mm 20mm 16mm;
+        @top-right {
+            content: "{{ brand_css }} PROPOSAL";
+            font-family: Helvetica, Arial, sans-serif;
+            font-size: 7pt; font-weight: 700; letter-spacing: 1.5px; color: #b45309;
         }
-
-        @page :first {
-            margin: 20mm;
-            @top-left {
-                content: "";
-                border: none;
-            }
-            @top-right {
-                content: "";
-                background-image: none;
-                border: none;
-            }
-            @bottom-right {
-                content: "";
-            }
-            @bottom-left {
-                content: "";
-            }
+        @bottom-left {
+            content: "{{ brand_plain }} Proposal  \\2022  {{ project_css }}  \\2022  Generated by SpaceIO";
+            font-family: Helvetica, Arial, sans-serif;
+            font-size: 7pt; color: #94a3b8;
         }
-        
-        body {
-            font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
-            color: #1e293b;
-            margin: 0;
-            padding: 0;
-            font-size: 9.5pt;
-            line-height: 1.5;
-            background-color: #ffffff;
+        @bottom-right {
+            content: "Page " counter(page) " of " counter(pages);
+            font-family: Helvetica, Arial, sans-serif;
+            font-size: 7pt; color: #94a3b8;
         }
+    }
+    @page :first {
+        margin: 16mm;
+        @top-right { content: none; }
+        @bottom-left { content: none; }
+        @bottom-right { content: none; }
+    }
 
-        /* --- COVER PAGE --- */
-        .cover-page {
-            page-break-after: always;
-            height: 250mm;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 15mm 0;
-            box-sizing: border-box;
-        }
+    * { box-sizing: border-box; }
+    body {
+        font-family: Helvetica, Arial, sans-serif;
+        color: #1e293b; margin: 0; padding: 0;
+        font-size: 9pt; line-height: 1.45; background: #ffffff;
+    }
+    table { border-collapse: collapse; }
 
-        .cover-header {
-            margin-bottom: 35mm;
-        }
+    /* ---------- COVER ---------- */
+    .cover { page-break-after: always; break-after: page; height: 255mm; position: relative; }
+    .cover-brand td { border: none; padding: 0; vertical-align: middle; }
+    .brand-icon {
+        width: 38px; height: 38px; border-radius: 8px; background: #1c1917; color: #fff;
+        font-weight: 700; font-size: 18px; line-height: 38px; text-align: center;
+    }
+    .brand-name { font-size: 15pt; font-weight: 700; color: #0f172a; padding-left: 10px; }
+    .brand-sub { font-size: 7pt; color: #b45309; font-weight: 700; letter-spacing: 1.5px; padding-left: 10px; }
+    .cover-hero { margin-top: 62mm; }
+    .cover-badge {
+        display: inline-block; font-size: 7.5pt; font-weight: 700; color: #b45309;
+        background: #fef3c7; padding: 4px 10px; border-radius: 4px; letter-spacing: 1.2px;
+    }
+    .cover-title {
+        font-size: 28pt; font-weight: 700; color: #0f172a; line-height: 1.2;
+        margin: 10px 0 8px 0; letter-spacing: normal; word-spacing: normal;
+        font-kerning: normal; overflow-wrap: break-word;
+    }
+    .cover-sub { font-size: 10.5pt; color: #475569; margin: 0 0 10mm 0; }
+    .rule { border: none; border-top: 2px solid #e2e8f0; margin: 0 0 6mm 0; }
+    .meta-title { font-size: 7.5pt; font-weight: 700; color: #94a3b8; letter-spacing: 2px; margin-bottom: 8px; }
+    .meta-table { width: 100%; }
+    .meta-table td { border: none; padding: 7px 15px 7px 0; vertical-align: top; width: 50%; }
+    .meta-label { font-size: 7pt; font-weight: 700; color: #64748b; letter-spacing: 1px; text-transform: uppercase; }
+    .meta-value { font-size: 10pt; font-weight: 600; color: #1e293b; overflow-wrap: break-word; }
+    .meta-code { font-family: 'Courier New', Courier, monospace; font-size: 10pt; font-weight: 700; color: #b45309; }
 
-        .logo-container {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
+    /* ---------- SECTIONS ---------- */
+    .section-title {
+        font-size: 13pt; font-weight: 700; color: #0f172a; margin: 0 0 10px 0;
+        border-bottom: 2px solid #e2e8f0; padding-bottom: 5px;
+        break-after: avoid; page-break-after: avoid;
+    }
+    .room { margin-bottom: 12px; }
+    .room-header {
+        font-size: 10pt; font-weight: 700; color: #1e293b; background: #f8fafc;
+        border-left: 3px solid #b45309; padding: 5px 10px; margin-bottom: 0;
+        text-transform: uppercase; letter-spacing: 0.8px;
+        break-after: avoid; page-break-after: avoid;
+    }
 
-        .logo-icon {
-            display: inline-block;
-            width: 38px;
-            height: 38px;
-            border-radius: 10px;
-            background: linear-gradient(135deg, #1c1917, #b45309);
-            color: white;
-            font-weight: 900;
-            font-size: 20px;
-            line-height: 38px;
-            text-align: center;
-            vertical-align: middle;
-        }
+    table.items { width: 100%; table-layout: fixed; }
+    table.items thead { display: table-header-group; }
+    table.items tr { break-inside: avoid; page-break-inside: avoid; }
+    table.items th {
+        background: #f1f5f9; color: #475569; font-weight: 700; text-align: left;
+        padding: 6px 8px; font-size: 7pt; border-bottom: 1.5px solid #e2e8f0;
+        text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    table.items td {
+        padding: 6px 8px; font-size: 8.5pt; border-bottom: 1px solid #eef2f7;
+        vertical-align: top; line-height: 1.35; overflow-wrap: break-word;
+    }
+    .c-no { width: 6%; text-align: center; }
+    .c-item { width: 34%; }
+    .c-cat { width: 16%; }
+    .c-qty { width: 15%; text-align: center; }
+    .c-rate { width: 14%; text-align: right; }
+    .c-amt { width: 15%; text-align: right; }
+    .sub { font-size: 7pt; color: #718096; }
+    .remark { font-size: 7pt; color: #b45309; font-style: italic; margin-top: 2px; }
+    tr.room-total td {
+        background: #f8fafc; font-weight: 700; font-size: 8.5pt; border-bottom: 1.5px solid #e2e8f0;
+    }
 
-        .brand-text {
-            display: inline-block;
-            vertical-align: middle;
-            margin-left: 8px;
-        }
+    /* ---------- SUMMARY / TERMS / SIGNATURES (kept together) ---------- */
+    .closing { break-inside: avoid; page-break-inside: avoid; margin-top: 14px; }
+    .summary { width: 100%; }
+    .summary td { border: none; padding: 0; vertical-align: top; }
+    .summary-box { width: 290px; background: #f8fafc; border: 1px solid #e2e8f0; }
+    .summary-box td { padding: 6px 12px; font-size: 8.5pt; }
+    .s-label { font-weight: 600; color: #64748b; }
+    .s-value { font-weight: 700; color: #1e293b; text-align: right; }
+    .s-discount, .s-discount .s-label, .s-discount .s-value { color: #c53030; }
+    tr.grand td { background: #1c1917; padding: 8px 12px; }
+    tr.grand .s-label, tr.grand .s-value { color: #ffffff; font-weight: 700; font-size: 10pt; }
 
-        .logo-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 18pt;
-            font-weight: 800;
-            color: #0f172a;
-            letter-spacing: -0.5px;
-            line-height: 1.1;
-        }
+    .terms { margin-top: 14px; background: #fafbfc; border: 1px solid #e2e8f0; padding: 12px 16px; }
+    .terms-title {
+        font-weight: 700; font-size: 9pt; color: #0f172a; margin-bottom: 6px;
+        text-transform: uppercase; letter-spacing: 0.8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px;
+    }
+    .terms-body { font-size: 8pt; color: #475569; line-height: 1.55; white-space: pre-line; }
 
-        .logo-subtitle {
-            font-family: 'Outfit', sans-serif;
-            font-size: 7.5pt;
-            color: #b45309;
-            font-weight: 700;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-        }
+    .sig { width: 100%; margin-top: 8px; }
+    .sig td { border: none; width: 50%; vertical-align: top; padding: 0; }
+    .sig-line { margin-top: 34px; border-top: 1px solid #cbd5e1; padding-top: 5px; width: 75%; }
+    .sig-right .sig-line { margin-left: auto; text-align: right; }
+    .sig-label { font-size: 8pt; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.4px; }
+    .sig-sub { font-size: 7pt; color: #94a3b8; margin-top: 1px; }
 
-        .cover-title-block {
-            margin-bottom: auto;
-            margin-top: 15mm;
-        }
-
-        .cover-badge {
-            display: inline-block;
-            font-family: 'Outfit', sans-serif;
-            font-size: 8pt;
-            font-weight: 800;
-            color: #b45309;
-            background-color: #fef3c7;
-            padding: 5px 12px;
-            border-radius: 9999px;
-            letter-spacing: 1.5px;
-            margin-bottom: 18px;
-            text-transform: uppercase;
-        }
-
-        .cover-project-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 34pt;
-            font-weight: 900;
-            color: #0f172a;
-            line-height: 1.15;
-            margin: 0 0 12px 0;
-            letter-spacing: -1px;
-        }
-
-        .cover-project-subtitle {
-            font-size: 11.5pt;
-            color: #475569;
-            margin: 0;
-            max-width: 85%;
-            font-weight: 400;
-            line-height: 1.6;
-        }
-
-        .project-details-grid {
-            margin-top: auto;
-            border-top: 2px solid #f1f5f9;
-            padding-top: 25px;
-        }
-
-        .details-section-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 8.5pt;
-            font-weight: 800;
-            color: #94a3b8;
-            letter-spacing: 2px;
-            margin-bottom: 15px;
-            text-transform: uppercase;
-        }
-
-        .cover-meta-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .cover-meta-table td {
-            border: none;
-            padding: 10px 25px 10px 0;
-            vertical-align: top;
-            width: 50%;
-        }
-
-        .grid-cell.label {
-            font-family: 'Outfit', sans-serif;
-            font-size: 8pt;
-            font-weight: 700;
-            color: #64748b;
-            letter-spacing: 1.2px;
-            text-transform: uppercase;
-            margin-bottom: 3px;
-        }
-
-        .grid-cell.value {
-            font-size: 10.5pt;
-            font-weight: 600;
-            color: #1e293b;
-        }
-
-        .font-bold {
-            font-weight: 700 !important;
-            color: #0f172a !important;
-        }
-
-        .code-font {
-            font-family: 'Courier New', Courier, monospace;
-            font-weight: 700 !important;
-            color: #b45309 !important;
-        }
-
-        /* --- SECTION HEADERS --- */
-        .section-title {
-            font-family: 'Outfit', sans-serif;
-            font-size: 15pt;
-            font-weight: 800;
-            color: #0f172a;
-            margin-top: 40px;
-            margin-bottom: 20px;
-            border-bottom: 2px solid #f1f5f9;
-            padding-bottom: 8px;
-            page-break-after: avoid;
-            letter-spacing: -0.3px;
-        }
-
-        .room-section {
-            margin-bottom: 35px;
-            page-break-inside: avoid;
-        }
-
-        .room-header {
-            font-family: 'Outfit', sans-serif;
-            font-size: 11.5pt;
-            font-weight: 800;
-            color: #1e293b;
-            background-color: #f8fafc;
-            border-left: 4px solid #b45309;
-            padding: 8px 14px;
-            margin-bottom: 15px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            border-radius: 0 8px 8px 0;
-        }
-
-        /* --- TABLE STYLING --- */
-        table.items-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 20px;
-        }
-
-        table.items-table th {
-            background-color: #f8fafc;
-            color: #475569;
-            font-weight: 800;
-            text-align: left;
-            padding: 10px 14px;
-            font-size: 8.5pt;
-            border-bottom: 2px solid #e2e8f0;
-            text-transform: uppercase;
-            letter-spacing: 0.8px;
-        }
-
-        table.items-table td {
-            padding: 12px 14px;
-            font-size: 9pt;
-            border-bottom: 1px solid #f1f5f9;
-            vertical-align: top;
-            line-height: 1.4;
-        }
-
-        table.items-table tr:nth-child(even) {
-            background-color: #fafbfd;
-        }
-
-        .col-item { width: 45%; }
-        .col-category { width: 25%; }
-        .col-qty { width: 12%; text-align: center; }
-        .col-rate { width: 18%; text-align: right; }
-
-        .text-right { text-align: right; }
-        .text-center { text-align: center; }
-
-        /* --- SUMMARY BLOCK --- */
-        .summary-wrapper {
-            margin-top: 30px;
-            margin-bottom: 40px;
-            page-break-inside: avoid;
-        }
-
-        .summary-table {
-            width: 320px;
-            margin-left: auto;
-            margin-right: 0;
-            background-color: #f8fafc;
-            border-radius: 12px;
-            border: 1px solid #e2e8f0;
-            border-collapse: separate;
-            border-spacing: 0;
-            overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
-        }
-
-        .summary-table td {
-            border: none;
-            padding: 10px 16px;
-            font-size: 9.5pt;
-        }
-
-        .summary-label {
-            font-weight: 600;
-            color: #64748b;
-            text-align: left;
-        }
-
-        .summary-value {
-            font-weight: 700;
-            color: #1e293b;
-            text-align: right;
-        }
-
-        .discount {
-            color: #e11d48 !important;
-        }
-
-        .grand-total-row td {
-            border-top: 1px solid #e2e8f0;
-            background-color: #1c1917;
-            padding: 14px 16px;
-            color: #ffffff !important;
-        }
-
-        .grand-total-row td:first-child {
-            border-bottom-left-radius: 11px;
-        }
-
-        .grand-total-row td:last-child {
-            border-bottom-right-radius: 11px;
-        }
-
-        .grand-total-row .summary-label {
-            color: #ffffff !important;
-            font-weight: 800;
-            font-size: 11pt;
-        }
-
-        .grand-total-row .summary-value,
-        .grand-total-row .text-right {
-            color: #ffffff !important;
-            font-weight: 800;
-            font-size: 12pt;
-        }
-
-        /* --- TERMS & SIGNATURES --- */
-        .terms-section {
-            margin-top: 40px;
-            margin-bottom: 40px;
-            page-break-inside: avoid;
-            background-color: #fafbfc;
-            border: 1px solid #e2e8f0;
-            padding: 24px;
-            border-radius: 12px;
-        }
-
-        .terms-title {
-            font-family: 'Outfit', sans-serif;
-            font-weight: 800;
-            font-size: 10pt;
-            color: #0f172a;
-            margin-bottom: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            border-bottom: 1px solid #e2e8f0;
-            padding-bottom: 8px;
-        }
-
-        .terms-content {
-            font-size: 8.5pt;
-            color: #475569;
-            line-height: 1.6;
-            white-space: pre-line;
-        }
-
-        .signature-block {
-            margin-top: 50px;
-            page-break-inside: avoid;
-            width: 100%;
-        }
-
-        .sig-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .sig-table td {
-            border: none;
-            width: 50%;
-            vertical-align: top;
-            padding: 0;
-        }
-
-        .sig-box {
-            width: 80%;
-            margin-top: 45px;
-            border-top: 1px solid #cbd5e1;
-            padding-top: 8px;
-            text-align: center;
-        }
-
-        .sig-label {
-            font-family: 'Outfit', sans-serif;
-            font-size: 9pt;
-            font-weight: 700;
-            color: #475569;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .sig-subtext {
-            font-size: 7.5pt;
-            color: #94a3b8;
-            margin-top: 2px;
-        }
-
-        @media print {
-            .no-print {
-                display: none !important;
-            }
-        }
-    </style>
+    @media print { .no-print { display: none !important; } }
+</style>
 </head>
 <body>
-    {% if weasyprint_failed %}
-    <div style="background-color: #FFFBEB; border: 1px solid #F59E0B; color: #B45309; padding: 20px; margin: 20px; border-radius: 12px; font-family: 'Outfit', sans-serif; font-size: 11pt; line-height: 1.5; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);" class="no-print">
-        <strong style="font-size: 13pt; color: #D97706;">⚠️ Print-Friendly Preview Mode</strong><br>
-        WeasyPrint is not fully configured on this local server environment.
-        You can easily save this quotation as a high-quality PDF using your browser:
-        <ul style="margin: 8px 0 0 20px; padding: 0;">
-            <li>Press <strong>Cmd + P</strong> (Mac) or <strong>Ctrl + P</strong> (Windows).</li>
-            <li>Select <strong>Save as PDF</strong> as the Destination.</li>
-            <li>Under <em>More Settings</em> / <em>Options</em>, check the <strong>Background graphics</strong> option to keep colors and layout styling.</li>
-        </ul>
-    </div>
-    {% endif %}
+{% if weasyprint_failed %}
+<div class="no-print" style="background:#FFFBEB;border:1px solid #F59E0B;color:#B45309;padding:14px;margin:10px 0;font-size:9pt;">
+    <strong>Print-Friendly Preview Mode</strong><br>
+    Press <strong>Cmd + P</strong> (Mac) or <strong>Ctrl + P</strong> (Windows) and choose Save as PDF.
+</div>
+{% endif %}
 
-    <!-- COVER PAGE -->
-    <div class="cover-page">
-        <div class="cover-header">
-            <div style="display: flex; align-items: center; gap: 14px;">
-                <img src="{{ quotation.creator.company_logo if (quotation.creator and quotation.creator.company_logo) else 'http://localhost:3000/spaceio_logo.png' }}" alt="Brand Logo" style="height: 40px; max-width: 150px; width: auto; display: inline-block; vertical-align: middle;" />
-                <div class="brand-text" style="border-left: 2.5px solid #cbd5e1; padding-left: 12px; margin-left: 4px; display: inline-block; vertical-align: middle; line-height: 1.25;">
-                    <span class="logo-title" style="font-family: 'Outfit', sans-serif; font-size: 16pt; font-weight: 900; color: #0f172a; letter-spacing: -0.5px; display: block; margin-bottom: 2px;">{{ quotation.creator.name if (quotation.creator and quotation.creator.name) else 'SpaceIO' }}</span>
-                    <span class="logo-subtitle" style="font-family: 'Outfit', sans-serif; font-size: 7pt; color: #b45309; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; display: block;">INTERIOR DESIGN</span>
-                </div>
-            </div>
-        </div>
-        
-        <div class="cover-title-block">
-            <span class="cover-badge">DESIGN PROPOSAL & ESTIMATE</span>
-            <h1 class="cover-project-title">{{ quotation.project_name }}</h1>
-            <p class="cover-project-subtitle">Complete interior design execution & supply estimate.</p>
-        </div>
-        
-        <div class="project-details-grid">
-            <div class="details-section-title">PROJECT & PROPOSAL METADATA</div>
-            <table class="cover-meta-table">
-                <tr>
-                    <td class="meta-col">
-                        <div class="grid-cell label">CLIENT NAME</div>
-                        <div class="grid-cell value font-bold">{{ quotation.client_name }}</div>
-                    </td>
-                    <td class="meta-col">
-                        <div class="grid-cell label">PROPOSAL DATE</div>
-                        <div class="grid-cell value">{{ date_str }}</div>
-                    </td>
-                </tr>
-                <tr>
-                    <td class="meta-col">
-                        <div class="grid-cell label">PROJECT NAME</div>
-                        <div class="grid-cell value">{{ quotation.project_name }}</div>
-                    </td>
-                    <td class="meta-col">
-                        <div class="grid-cell label">QUOTE VERSION</div>
-                        <div class="grid-cell value font-bold">V{{ quotation.version }}</div>
-                    </td>
-                </tr>
-                <tr>
-                    <td class="meta-col">
-                        <div class="grid-cell label">SITE ADDRESS</div>
-                        <div class="grid-cell value">{{ quotation.site_address or 'Not Provided' }}</div>
-                    </td>
-                    <td class="meta-col">
-                        <div class="grid-cell label">QUOTE NUMBER</div>
-                        <div class="grid-cell value code-font">
-                            {% if quotation.id %}
-                              {% if quotation.id.startswith('local_') %}
-                                LQ-{{ quotation.id[-6:] | upper }}
-                              {% else %}
-                                QT-{{ quotation.id[:8] | upper }}
-                              {% endif %}
-                            {% else %}
-                              DRAFT
-                            {% endif %}
-                        </div>
-                    </td>
-                </tr>
-                {% if quotation.creator %}
-                <tr>
-                    <td class="meta-col">
-                        <div class="grid-cell label">PREPARED BY</div>
-                        <div class="grid-cell value font-bold">{{ quotation.creator.name }}</div>
-                    </td>
-                    <td class="meta-col">
-                        <div class="grid-cell label">DESIGNER CONTACT</div>
-                        <div class="grid-cell value">
-                            {% if quotation.creator.phone %}Phone: {{ quotation.creator.phone }}<br>{% endif %}
-                            {% if quotation.creator.email %}Email: {{ quotation.creator.email }}{% endif %}
-                        </div>
-                    </td>
-                </tr>
-                {% endif %}
-            </table>
-        </div>
-    </div>
+<!-- COVER -->
+<div class="cover">
+    <table class="cover-brand">
+        <tr>
+            {% if creator.company_logo %}
+            <td style="padding-right: 6px;">
+                <img src="{{ creator.company_logo }}" alt="Logo" style="height: 72px; max-width: 200px; width: auto;" />
+            </td>
+            {% else %}
+            <td style="width: 48px;">
+                <div class="brand-icon">{{ brand[:1] | upper }}</div>
+            </td>
+            {% endif %}
+            <td>
+                <div class="brand-name">{{ brand }}</div>
+                <div class="brand-sub">INTERIOR DESIGN</div>
+            </td>
+        </tr>
+    </table>
 
-    <!-- ROOM DETAILS -->
-    <h2 class="section-title">Itemized Estimates by Room</h2>
-    
-    {% for room_id, room_items in rooms_grouped.items() %}
-    <div class="room-section">
-        <h3 class="room-header">{{ room_items[0].room_name }}</h3>
-        <table class="items-table">
-            <thead>
-                <tr>
-                    <th class="col-item">Item & Description</th>
-                    <th class="col-category">Category</th>
-                    <th class="col-qty text-center">Qty</th>
-                    <th class="col-rate text-right">Final Rate</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for qi in room_items %}
-                <tr>
-                    <td class="col-item">
-                        <strong>{{ qi.item_name }}</strong><br>
-                        {% if qi.item_dimensions %}
-                        <span style="font-size: 8pt; color: #718096;">
-                            Dimensions: {{ qi.item_dimensions }}
-                        </span>
-                        {% endif %}
-                        {% if qi.remark %}
-                        <div style="font-size: 8pt; color: #b45309; margin-top: 4px; font-style: italic;">
-                            Remark: {{ qi.remark }}
-                        </div>
-                        {% endif %}
-                    </td>
-                    <td class="col-category" style="font-size: 9pt; color: #4A5568; vertical-align: top;">
-                        {{ qi.category_name }}
-                    </td>
-                    <td class="col-qty text-center" style="vertical-align: top;">
-                        {{ qi.qty }} {% if qi.qty == 1 %}pc{% else %}pcs{% endif %}
-                        {% if qi.pricing_type == 'sq_ft' %}
-                        {% set sec_dim = qi.height if (qi.height and qi.height > 0) else (qi.breadth if (qi.breadth and qi.breadth > 0) else 1.0) %}
-                        {% set area = (qi.length or 1.0) * sec_dim %}
-                        <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
-                            {{ "{:g}".format(area) }} sq_ft
-                        </span>
-                        {% elif qi.pricing_type == 'running_ft' %}
-                        <br><span style="font-size: 7.5pt; color: #64748b; white-space: nowrap; display: block; margin-top: 3px;">
-                            {{ "{:g}".format(qi.length or 1.0) }} ft
-                        </span>
-                        {% endif %}
-                    </td>
-                    <td class="col-rate text-right" style="vertical-align: top;">₹{{ "{:,.2f}".format(qi.total_amount) }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    {% endfor %}
+    <div class="cover-hero">
+        <div class="cover-badge">DESIGN PROPOSAL &amp; ESTIMATE</div>
+        <h1 class="cover-title">{{ quotation.project_name or 'Untitled Project' }}</h1>
+        <p class="cover-sub">Complete interior design execution &amp; supply estimate.</p>
+        <hr class="rule">
 
-    <!-- BILLING SUMMARY -->
-    <h2 class="section-title" style="page-break-before: avoid;">Cost Summary</h2>
-    <div class="summary-wrapper" style="clear: both; overflow: auto; width: 100%;">
-        <table class="summary-table" style="width: 350px; margin-left: auto; margin-right: 0;">
+        <div class="meta-title">PROJECT &amp; PROPOSAL DETAILS</div>
+        <table class="meta-table">
             <tr>
-                <td class="summary-label">Total Item Price:</td>
-                <td class="text-right" style="color: #1e293b; font-weight: 700;">₹{{ "{:,.2f}".format(quotation.subtotal) }}</td>
+                <td><div class="meta-label">Client Name</div><div class="meta-value">{{ quotation.client_name or '-' }}</div></td>
+                <td><div class="meta-label">Proposal Date</div><div class="meta-value">{{ date_str }}</div></td>
             </tr>
             <tr>
-                <td class="summary-label">Additional GST / Taxes:</td>
-                <td class="text-right" style="color: #1e293b; font-weight: 500;">₹{{ "{:,.2f}".format(quotation.gst_amount) }}</td>
+                <td><div class="meta-label">Project Name</div><div class="meta-value">{{ quotation.project_name or '-' }}</div></td>
+                <td><div class="meta-label">Quote Version</div><div class="meta-value">V{{ quotation.version or 1 }}</div></td>
             </tr>
-            {% if quotation.discount_amount > 0 %}
             <tr>
-                <td class="summary-label" style="color: #E53E3E; border-top: 1px solid #e2e8f0; padding-top: 10px;">Discount Applied:</td>
-                <td class="text-right" style="color: #E53E3E; border-top: 1px solid #e2e8f0; padding-top: 10px;">-₹{{ "{:,.2f}".format(quotation.discount_amount) }}</td>
+                <td><div class="meta-label">Site Address</div><div class="meta-value">{{ quotation.site_address or 'Not provided' }}</div></td>
+                <td><div class="meta-label">Quote Number</div><div class="meta-code">{{ quote_no }}</div></td>
+            </tr>
+            {% if creator.name or creator.phone or creator.email %}
+            <tr>
+                <td><div class="meta-label">Prepared By</div><div class="meta-value">{{ creator.name or brand }}</div></td>
+                <td>
+                    <div class="meta-label">Designer Contact</div>
+                    <div class="meta-value">
+                        {% if creator.phone %}{{ creator.phone }}{% endif %}{% if creator.phone and creator.email %}<br>{% endif %}{% if creator.email %}{{ creator.email }}{% endif %}
+                    </div>
+                </td>
             </tr>
             {% endif %}
-            <tr class="grand-total-row">
-                <td class="summary-label">Grand Total:</td>
-                <td class="text-right">₹{{ "{:,.2f}".format(quotation.grand_total) }}</td>
-            </tr>
         </table>
     </div>
+</div>
 
-    <!-- TERMS & CONDITIONS -->
-    {% if quotation.terms_conditions %}
-    <div class="terms-section">
-        <div class="terms-title">Terms & Conditions</div>
-        <div class="terms-content" style="white-space: pre-wrap;">{{ quotation.terms_conditions }}</div>
-    </div>
-    {% else %}
-    <div class="terms-section">
-        <div class="terms-title">Standard Project Terms</div>
-        <div class="terms-content" style="white-space: pre-wrap;">{% if quotation.creator and quotation.creator.general_terms %}{{ quotation.creator.general_terms }}{% else %}1. Payment Terms: 40% Booking Advance, 40% on Material Delivery, 20% on Completion.
-2. Prices are valid for 30 days from the proposal generation date.
-3. Any extra items or alterations requested outside this proposal will be billed separately.
-4. Completion timeline is subject to site handover, client design approvals, and timely payment stages.{% endif %}</div>
-    </div>
-    {% endif %}
-
-    <!-- SIGNATURES -->
-    <div class="signature-block">
-        <table class="sig-table">
+<!-- ITEMS -->
+<h2 class="section-title">Itemized Estimates by Room</h2>
+{% for room in rooms %}
+<div class="room">
+    <div class="room-header">{{ room.name }}</div>
+    <table class="items">
+        <thead>
             <tr>
-                <td>
-                    <div class="sig-box" style="margin-left: 0; text-align: left;">
-                        <div class="sig-label">Authorized Designer / Architect</div>
-                        <div class="sig-subtext">For {% if quotation.creator and quotation.creator.name %}{{ quotation.creator.name }}{% else %}SpaceIO{% endif %}</div>
-                    </div>
-                </td>
-                <td>
-                    <div class="sig-box" style="margin-right: 0; margin-left: auto; text-align: right;">
-                        <div class="sig-label">Client Acceptance Signature</div>
-                        <div class="sig-subtext">Accepted By: {{ quotation.client_name }}</div>
-                    </div>
-                </td>
+                <th class="c-no">#</th>
+                <th class="c-item">Item &amp; Description</th>
+                <th class="c-cat">Category</th>
+                <th class="c-qty" style="text-align:center;">Qty</th>
+                <th class="c-rate" style="text-align:right;">Final Rate</th>
+                <th class="c-amt" style="text-align:right;">Amount</th>
             </tr>
-        </table>
+        </thead>
+        <tbody>
+            {% for qi in room['items'] %}
+            <tr>
+                <td class="c-no">{{ loop.index }}</td>
+                <td class="c-item">
+                    <strong>{{ qi.item_name or 'Item' }}</strong>
+                    {% if qi.item_brand %}<div class="sub">{{ qi.item_brand }}</div>{% endif %}
+                    {% if qi.item_dimensions %}<div class="sub">{{ qi.item_dimensions }}</div>{% endif %}
+                    {% if qi.remark %}<div class="remark">{{ qi.remark }}</div>{% endif %}
+                </td>
+                <td class="c-cat">{{ qi.category_name or '-' }}</td>
+                <td class="c-qty">{{ qi | qty_label }}</td>
+                <td class="c-rate">{{ qi.final_price | inr }}</td>
+                <td class="c-amt"><strong>{{ qi.total_amount | inr }}</strong></td>
+            </tr>
+            {% endfor %}
+            <tr class="room-total">
+                <td colspan="5" style="text-align:right;">{{ room.name }} total</td>
+                <td class="c-amt">{{ room.total | inr }}</td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+{% endfor %}
+
+<!-- SUMMARY + TERMS + SIGNATURES -->
+<div class="closing">
+    <h2 class="section-title">Cost Summary</h2>
+    <table class="summary">
+        <tr>
+            <td></td>
+            <td style="width: 290px;">
+                <table class="summary-box">
+                    <tr><td class="s-label">Items subtotal (excl. GST)</td><td class="s-value">{{ total_excl_gst | inr }}</td></tr>
+                    <tr><td class="s-label">GST / Taxes</td><td class="s-value">{{ total_gst | inr }}</td></tr>
+                    {% if discount > 0 %}
+                    <tr class="s-discount"><td class="s-label">Discount</td><td class="s-value">-{{ discount | inr }}</td></tr>
+                    {% endif %}
+                    <tr class="grand"><td class="s-label">Grand Total</td><td class="s-value">{{ grand_total | inr }}</td></tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+
+    <div class="terms">
+        <div class="terms-title">{{ terms_title }}</div>
+        <div class="terms-body">{{ terms_body }}</div>
     </div>
 
+    <table class="sig">
+        <tr>
+            <td>
+                <div class="sig-line">
+                    <div class="sig-label">Authorized Designer / Architect</div>
+                    <div class="sig-sub">For {{ brand }}</div>
+                </div>
+            </td>
+            <td class="sig-right">
+                <div class="sig-line">
+                    <div class="sig-label">Client Acceptance Signature</div>
+                    <div class="sig-sub">Accepted By: {{ quotation.client_name or '' }}</div>
+                </div>
+            </td>
+        </tr>
+    </table>
+</div>
 </body>
 </html>
 """
 
-def generate_quotation_html(quotation_dict: dict, weasyprint_failed: bool = False) -> str:
-    """
-    Renders the HTML quotation layout using Jinja2 templates.
-    """
-    # Group item entries room-wise for cleaner presentation
-    rooms_grouped = {}
+DEFAULT_TERMS = (
+    "1. Payment Terms: 40% Booking Advance, 40% on Material Delivery, 20% on Completion.\n"
+    "2. Prices are valid for 30 days from the proposal generation date.\n"
+    "3. Any extra items or alterations requested outside this proposal will be billed separately.\n"
+    "4. Completion timeline is subject to site handover, client design approvals, and timely payment stages."
+)
+
+
+def _build_context(quotation_dict: dict, weasyprint_failed: bool) -> dict:
+    creator = quotation_dict.get("creator") or {}
+    brand = (creator.get("name") or "").strip() or "SpaceIO"
+
+    # Group by room, preserving first-seen order
+    rooms_map = {}
     total_excl_gst = 0.0
     total_item_gst = 0.0
-    for qi in quotation_dict.get("items", []):
-        room_id = qi["room_id"]
-        if room_id not in rooms_grouped:
-            rooms_grouped[room_id] = []
-        rooms_grouped[room_id].append(qi)
-        
-        # Calculate pre-tax price and GST contribution for each item
-        total_amt = qi.get("total_amount", 0.0)
-        gst_percent = qi.get("snapshot_gst_percent", 0.0)
-        pre_tax = total_amt / (1.0 + (gst_percent / 100.0))
-        item_gst = total_amt - pre_tax
+    for qi in quotation_dict.get("items") or []:
+        key = qi.get("room_id") or qi.get("room_name") or "general"
+        room = rooms_map.setdefault(
+            key,
+            {"name": (qi.get("room_name") or "").strip() or "General", "items": [], "total": 0.0},
+        )
+        room["items"].append(qi)
+        total_amt = _num(qi.get("total_amount"))
+        room["total"] += total_amt
+
+        gst_percent = _num(qi.get("snapshot_gst_percent"))
+        pre_tax = total_amt / (1.0 + gst_percent / 100.0)
         total_excl_gst += pre_tax
-        total_item_gst += item_gst
-        
-    date_str = datetime.now().strftime("%B %d, %Y")
-    
-    # Load Jinja template
-    template = Template(HTML_TEMPLATE)
-    html_content = template.render(
-        quotation=quotation_dict,
-        rooms_grouped=rooms_grouped,
-        date_str=date_str,
-        weasyprint_failed=weasyprint_failed,
-        total_excl_gst=total_excl_gst,
-        total_item_gst=total_item_gst
-    )
-    return html_content
+        total_item_gst += total_amt - pre_tax
+
+    global_gst = _num(quotation_dict.get("gst_amount"))
+    total_gst = total_item_gst + global_gst
+    discount = _num(quotation_dict.get("discount_amount"))
+    grand_total = _num(quotation_dict.get("grand_total"))
+
+    created = _parse_date(quotation_dict.get("created_at")) or datetime.now()
+
+    custom_terms = (quotation_dict.get("terms_conditions") or "").strip()
+    if custom_terms:
+        terms_title, terms_body = "Terms & Conditions", custom_terms
+    else:
+        terms_title = "Standard Project Terms"
+        terms_body = (creator.get("general_terms") or "").strip() or DEFAULT_TERMS
+
+    return {
+        "quotation": quotation_dict,
+        "creator": creator,
+        "brand": brand,
+        "brand_css": css_str(brand).upper(),
+        "brand_plain": css_str(brand),
+        "project_css": css_str(quotation_dict.get("project_name")),
+        "rooms": list(rooms_map.values()),
+        "date_str": created.strftime("%B %d, %Y"),
+        "quote_no": quote_number(quotation_dict),
+        "weasyprint_failed": weasyprint_failed,
+        "total_excl_gst": total_excl_gst,
+        "total_gst": total_gst,
+        "discount": discount,
+        "grand_total": grand_total,
+        "terms_title": terms_title,
+        "terms_body": terms_body,
+    }
+
+
+_TEMPLATE_CACHE = None
+
+
+def _jinja_template() -> Template:
+    """Compile the template once per process (parsing it is pure overhead per request)."""
+    global _TEMPLATE_CACHE
+    if _TEMPLATE_CACHE is None:
+        from jinja2 import Environment
+        env = Environment(autoescape=True)
+        env.filters["inr"] = inr
+        env.filters["qty_label"] = qty_label
+        _TEMPLATE_CACHE = env.from_string(HTML_TEMPLATE)
+    return _TEMPLATE_CACHE
+
+
+def generate_quotation_html(quotation_dict: dict, weasyprint_failed: bool = False) -> str:
+    """Render the quotation as HTML (single template, used for both PDF engines)."""
+    return _jinja_template().render(**_build_context(quotation_dict, weasyprint_failed))
+
+
+def _strip_page_rules(html: str) -> str:
+    """Remove @page blocks (incl. nested margin boxes) - xhtml2pdf cannot parse them."""
+    out, i = [], 0
+    while True:
+        m = re.search(r"@page\b[^{]*\{", html[i:])
+        if not m:
+            out.append(html[i:])
+            break
+        start = i + m.start()
+        out.append(html[i:start])
+        depth, j = 1, i + m.end()
+        while j < len(html) and depth:
+            depth += {"{": 1, "}": -1}.get(html[j], 0)
+            j += 1
+        i = j
+    return "".join(out)
+
+
+_XHTML2PDF_CSS = """
+<style>
+    @page { size: A4; margin: 16mm; }
+    .cover { height: auto; }
+    .cover-hero { margin-top: 40mm; }
+    .meta-table td { padding: 3px 10px 3px 0; }
+    .meta-label, .meta-value, .meta-code { margin: 0; padding: 0; line-height: 1.2; }
+    .cover-badge { display: block; }
+    .rule { border-top: 1px solid #e2e8f0; }
+</style>
+"""
+
+
+def _simplify_for_xhtml2pdf(html: str) -> str:
+    """xhtml2pdf mis-handles fixed heights, break-inside on rows and the ₹
+    glyph (its built-in Helvetica has none, so it prints a box). Tone the
+    markup down so the fallback still gives a readable proposal."""
+    out = _strip_page_rules(html)
+    # Fixed-height cover + per-row keep-together make xhtml2pdf put each
+    # cover row on its own page.
+    out = re.sub(r"(break|page-break)-inside:\s*avoid;?", "", out)
+    out = re.sub(r"height:\s*255mm;?", "", out)
+    out = out.replace("₹", "Rs. ")
+    return out.replace("</head>", _XHTML2PDF_CSS + "</head>")
+
+
+_PDF_CACHE: "OrderedDict[str, bytes]" = OrderedDict()
+_PDF_CACHE_MAX = 32
+_PDF_CACHE_LOCK = threading.Lock()
 
 
 def generate_quotation_pdf(quotation_dict: dict) -> bytes:
-    """
-    Renders an HTML quotation layout with Jinja2 and parses it into binary PDF using WeasyPrint.
-    """
-    if not WEASYPRINT_AVAILABLE:
-        raise ImportError(
-            f"WeasyPrint is not fully configured on your local system.\n"
-            f"System Dependency Error: {WEASYPRINT_ERROR}\n"
-            f"To enable dynamic PDF generation, please run: \n"
-            f"  brew install pango\n"
-            f"in your terminal and restart this server."
-        )
-
+    """Render to PDF bytes, reusing a recent result when the rendered HTML is identical
+    (re-downloading an unchanged quotation is then instant)."""
     html_content = generate_quotation_html(quotation_dict, weasyprint_failed=False)
-    
-    # Render using WeasyPrint
-    logger.info("Compiling PDF with WeasyPrint...")
-    pdf_bytes = HTML(string=html_content).write_pdf()
-    return pdf_bytes
+    key = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
+    with _PDF_CACHE_LOCK:
+        cached = _PDF_CACHE.get(key)
+        if cached is not None:
+            _PDF_CACHE.move_to_end(key)
+            return cached
+    pdf = _render_pdf(html_content)
+    with _PDF_CACHE_LOCK:
+        _PDF_CACHE[key] = pdf
+        while len(_PDF_CACHE) > _PDF_CACHE_MAX:
+            _PDF_CACHE.popitem(last=False)
+    return pdf
+
+
+def _render_pdf(html_content: str) -> bytes:
+    """
+    Render HTML to PDF bytes. WeasyPrint first (full layout, page
+    footer); xhtml2pdf as a no-system-deps fallback (no running footer).
+    """
+
+    if _load_weasyprint():
+        try:
+            logger.info("Compiling PDF with WeasyPrint...")
+            return HTML(string=html_content, url_fetcher=_safe_url_fetcher).write_pdf()
+        except Exception as e:
+            logger.warning(f"WeasyPrint rendering failed: {e}. Falling back to xhtml2pdf.")
+    else:
+        logger.warning(f"WeasyPrint unavailable ({WEASYPRINT_ERROR[:200]}). Using xhtml2pdf fallback.")
+
+    try:
+        import io
+        from xhtml2pdf import pisa
+
+        logger.info("Compiling PDF with xhtml2pdf (fallback)...")
+        simplified = _simplify_for_xhtml2pdf(html_content)
+        buf = io.BytesIO()
+        status = pisa.CreatePDF(io.BytesIO(simplified.encode("utf-8")), dest=buf)
+        if status.err:
+            logger.warning(f"xhtml2pdf reported {status.err} error(s) during rendering (non-fatal)")
+        pdf_bytes = buf.getvalue()
+        if pdf_bytes[:5] == b"%PDF-":
+            return pdf_bytes
+        raise RuntimeError("xhtml2pdf produced invalid PDF output")
+    except ImportError:
+        raise ImportError(
+            "No PDF engine available. Install either WeasyPrint (brew install pango) "
+            "or xhtml2pdf (pip install xhtml2pdf) to enable PDF generation."
+        )
+    except Exception as e:
+        logger.error(f"xhtml2pdf fallback also failed: {e}")
+        raise RuntimeError(f"PDF generation failed with all available engines: {e}")
+
+
+# Backward-compatible alias
+def generate_pdf(quotation_dict: dict) -> bytes:
+    return generate_quotation_pdf(quotation_dict)

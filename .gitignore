@@ -35,3 +35,9 @@ Thumbs.db
 
 # Logs
 logs/
+# local DB backups (contain user data)
+backups/
+
+# other env files hold DB passwords (keep the example file tracked)
+.env.*
+!.env.example

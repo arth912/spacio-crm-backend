@@ -54,7 +54,7 @@ def setup_logging():
     for logger_name in loggers_to_redirect:
         logger = logging.getLogger(logger_name)
         # Suppress verbose info progress statements from weasyprint and fontconfig
-        if "weasyprint" in logger_name or logger_name == "fontconfig":
+        if "weasyprint" in logger_name or logger_name in ("fontconfig", "sqlalchemy.engine"):
             logger.setLevel(logging.WARNING)
         else:
             logger.setLevel(logging.INFO)

@@ -2,19 +2,21 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from datetime import datetime
 
+LOGO_MAX = 1_500_000  # ~1.1 MB image as base64
+
 # --- AUTH SCHEMAS ---
 class UserRegister(BaseModel):
     name: str = Field(..., min_length=2, max_length=50)
     email: EmailStr
-    password: str = Field(..., min_length=6)
+    password: str = Field(..., min_length=6, max_length=72)
     role: str = Field("Designer", pattern="^(Admin|Designer|Sales)$")
     phone: str = Field(..., min_length=10, max_length=15)
-    company_logo: Optional[str] = None
+    company_logo: Optional[str] = Field(None, max_length=LOGO_MAX)
     selected_plan: str = Field("monthly", pattern="^(monthly|yearly)$")
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., max_length=72)
 
 class UserResponse(BaseModel):
     id: str
@@ -35,6 +37,20 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class UserListItem(BaseModel):
+    """Admin list row: omits the large company_logo / general_terms (fetched per user on demand)."""
+    id: str
+    name: str
+    email: EmailStr
+    role: str
+    phone: Optional[str] = None
+    is_approved: bool
+    created_at: datetime
+    access_start: Optional[datetime] = None
+    access_end: Optional[datetime] = None
+    payment_status: str
+    selected_plan: str
+
 class RegisterResponse(BaseModel):
     message: str
     user: UserResponse
@@ -44,23 +60,23 @@ class RegisterResponse(BaseModel):
     currency: Optional[str] = None
 
 class CreateSubscriptionOrderRequest(BaseModel):
-    user_id: str
+    user_id: str = Field(..., max_length=36)
     selected_plan: str = Field("monthly", pattern="^(monthly|yearly)$")
 
 
 class PaymentVerifyRequest(BaseModel):
-    user_id: str
-    razorpay_payment_id: str
-    razorpay_order_id: str
-    razorpay_signature: str
+    user_id: str = Field(..., max_length=36)
+    razorpay_payment_id: str = Field(..., max_length=100)
+    razorpay_order_id: str = Field(..., max_length=100)
+    razorpay_signature: str = Field(..., max_length=200)
     
     # Optional registration details (used to write user to DB after payment)
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
     email: Optional[EmailStr] = None
-    password: Optional[str] = None
-    phone: Optional[str] = None
-    company_logo: Optional[str] = None
-    selected_plan: Optional[str] = None
+    password: Optional[str] = Field(None, max_length=72)
+    phone: Optional[str] = Field(None, max_length=20)
+    company_logo: Optional[str] = Field(None, max_length=LOGO_MAX)
+    selected_plan: Optional[str] = Field(None, pattern="^(monthly|yearly)$")
 
 
 
@@ -68,37 +84,42 @@ class UserRoleUpdate(BaseModel):
     role: str = Field(..., pattern="^(Admin|Designer|Sales)$")
     access_start: Optional[datetime] = None
     access_end: Optional[datetime] = None
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
     email: Optional[EmailStr] = None
-    phone: Optional[str] = None
-    company_logo: Optional[str] = None
-    general_terms: Optional[str] = None
+    phone: Optional[str] = Field(None, max_length=20)
+    company_logo: Optional[str] = Field(None, max_length=LOGO_MAX)
+    general_terms: Optional[str] = Field(None, max_length=20000)
 
 class UserProfileUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
     email: Optional[EmailStr] = None
-    phone: Optional[str] = None
-    company_logo: Optional[str] = None
-    general_terms: Optional[str] = None
-    new_password: Optional[str] = None
+    phone: Optional[str] = Field(None, max_length=20)
+    company_logo: Optional[str] = Field(None, max_length=LOGO_MAX)
+    general_terms: Optional[str] = Field(None, max_length=20000)
+    new_password: Optional[str] = Field(None, min_length=6, max_length=72)
 
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
     user: UserResponse
 
+class LoginTokenResponse(BaseModel):
+    """Login/refresh return only the token; the client then calls GET /auth/me for the user."""
+    access_token: str
+    token_type: str
+
 # --- CLIENT SCHEMAS ---
 class ClientCreate(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    address: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=255)
+    phone: str = Field(..., min_length=1, max_length=50)
+    email: Optional[str] = Field(None, max_length=255)
+    address: Optional[str] = Field(None, max_length=2000)
 
 class ClientUpdate(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=255)
+    phone: Optional[str] = Field(None, max_length=50)
     email: Optional[EmailStr] = None
-    address: Optional[str] = None
+    address: Optional[str] = Field(None, max_length=2000)
 
 class ClientResponse(BaseModel):
     id: str
@@ -163,6 +184,9 @@ class CategoryResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class CategoryCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
 class ItemResponse(BaseModel):
     id: str
     category_id: str
@@ -180,31 +204,42 @@ class ItemResponse(BaseModel):
         from_attributes = True
 
 class ItemCreate(BaseModel):
-    category_id: str
-    subcategory: str
-    name: str
+    category_id: str = Field(..., max_length=36)
+    subcategory: str = Field(..., max_length=255)
+    name: str = Field(..., min_length=1, max_length=255)
     pricing_type: str = Field(..., pattern="^(sq_ft|running_ft|piece)$")
-    brand: str
-    base_rate: float = Field(..., ge=0.0)
-    labor_cost: float = Field(0.0, ge=0.0)
-    material: Optional[str] = None
-    dimensions: Optional[str] = None
+    brand: str = Field(..., max_length=255)
+    base_rate: float = Field(..., ge=0.0, le=100_000_000)
+    labor_cost: float = Field(0.0, ge=0.0, le=100_000_000)
+    material: Optional[str] = Field(None, max_length=255)
+    dimensions: Optional[str] = Field(None, max_length=255)
+
+class ItemUpdate(BaseModel):
+    category_id: Optional[str] = Field(None, max_length=36)
+    subcategory: Optional[str] = Field(None, max_length=255)
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    pricing_type: Optional[str] = Field(None, pattern="^(sq_ft|running_ft|piece)$")
+    brand: Optional[str] = Field(None, max_length=255)
+    base_rate: Optional[float] = Field(None, ge=0.0, le=100_000_000)
+    labor_cost: Optional[float] = Field(None, ge=0.0, le=100_000_000)
+    material: Optional[str] = Field(None, max_length=255)
+    dimensions: Optional[str] = Field(None, max_length=255)
 
 # --- QUOTATION ITEM SCHEMAS ---
 class QuotationItemCreate(BaseModel):
     room_id: str
     category_id: str
     item_id: str
-    qty: float
-    margin_percent: float = Field(0.0, ge=0.0)
-    gst_percent: float = Field(18.0, ge=0.0)
-    remark: Optional[str] = None
-    length: Optional[float] = 1.0
-    breadth: Optional[float] = 1.0
-    height: Optional[float] = 1.0
+    qty: float = Field(..., ge=0.0, le=1_000_000)
+    margin_percent: float = Field(0.0, ge=0.0, le=1000.0)
+    gst_percent: float = Field(18.0, ge=0.0, le=100.0)
+    remark: Optional[str] = Field(None, max_length=2000)
+    length: Optional[float] = Field(1.0, ge=0.0, le=1_000_000)
+    breadth: Optional[float] = Field(1.0, ge=0.0, le=1_000_000)
+    height: Optional[float] = Field(1.0, ge=0.0, le=1_000_000)
     pricing_type: Optional[str] = None
-    base_rate: Optional[float] = None
-    labor_cost: Optional[float] = None
+    base_rate: Optional[float] = Field(None, ge=0.0)
+    labor_cost: Optional[float] = Field(None, ge=0.0)
 
 class QuotationItemResponse(BaseModel):
     id: str
@@ -236,8 +271,8 @@ class QuotationItemResponse(BaseModel):
 class QuotationCreate(BaseModel):
     project_id: str
     discount_amount: float = Field(0.0, ge=0.0)
-    terms_conditions: Optional[str] = None
-    items: List[QuotationItemCreate]
+    terms_conditions: Optional[str] = Field(None, max_length=20000)
+    items: List[QuotationItemCreate] = Field(..., max_length=500)
     apply_global_gst: Optional[bool] = False
     global_gst_percent: Optional[float] = 0.0
 
@@ -275,6 +310,7 @@ class PaymentCreate(BaseModel):
 class PaymentResponse(BaseModel):
     id: str
     project_id: str
+    project_name: Optional[str] = None
     amount: float
     payment_date: datetime
     payment_method: str
@@ -306,13 +342,13 @@ class SubscriptionPaymentResponse(BaseModel):
 # --- PASSWORD RESET & EMAIL VERIFICATION SCHEMAS ---
 class EmailVerifyRequest(BaseModel):
     email: EmailStr
-    code: str
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 class PasswordResetRequest(BaseModel):
     email: EmailStr
 
 class PasswordResetConfirm(BaseModel):
     email: EmailStr
-    token: str
-    new_password: str = Field(..., min_length=6)
+    token: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(..., min_length=6, max_length=72)
 
