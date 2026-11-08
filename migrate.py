@@ -79,6 +79,9 @@ async def run_db_migrations():
             "CREATE INDEX IF NOT EXISTS ix_bills_project_id ON bills (project_id)",
             "CREATE INDEX IF NOT EXISTS ix_bill_items_bill_id ON bill_items (bill_id)",
             "CREATE INDEX IF NOT EXISTS ix_payments_bill_id ON payments (bill_id)",
+            # Lock out Supabase's public API (anon/authenticated); the backend role bypasses RLS
+            "ALTER TABLE bills ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE bill_items ENABLE ROW LEVEL SECURITY",
         ]:
             await conn.execute(text(ddl))
         print("Database migrations completed successfully.")
