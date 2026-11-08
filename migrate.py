@@ -33,6 +33,54 @@ async def run_db_migrations():
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_categories_owner_name ON categories (COALESCE(user_id, ''), lower(name))",
         ]:
             await conn.execute(text(ddl))
+        # Billing: template choice lives on the profile; payments can optionally settle a bill
+        for ddl in [
+            "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS billing_template VARCHAR(20) NOT NULL DEFAULT 'modern'",
+            "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS billing_terms TEXT",
+            "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS signature TEXT",
+            "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS stamp TEXT",
+            """CREATE TABLE IF NOT EXISTS bills (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                client_id VARCHAR(36) NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+                project_id VARCHAR(36) NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                bill_number VARCHAR(30) NOT NULL,
+                bill_date DATE NOT NULL,
+                due_date DATE,
+                status VARCHAR(20) NOT NULL DEFAULT 'draft',
+                template VARCHAR(20) NOT NULL DEFAULT 'modern',
+                customer_gstin VARCHAR(20),
+                notes TEXT,
+                subtotal DOUBLE PRECISION NOT NULL DEFAULT 0,
+                tax_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                discount_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                grand_total DOUBLE PRECISION NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT (now() at time zone 'utc'),
+                CONSTRAINT ux_bills_user_number UNIQUE (user_id, bill_number)
+            )""",
+            """CREATE TABLE IF NOT EXISTS bill_items (
+                id VARCHAR(36) PRIMARY KEY,
+                bill_id VARCHAR(36) NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL DEFAULT 0,
+                description VARCHAR(200) NOT NULL,
+                qty DOUBLE PRECISION NOT NULL,
+                rate DOUBLE PRECISION NOT NULL,
+                tax_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+                amount DOUBLE PRECISION NOT NULL
+            )""",
+            "ALTER TABLE bill_items ADD COLUMN IF NOT EXISTS pricing_type VARCHAR(20) NOT NULL DEFAULT 'piece'",
+            "ALTER TABLE bill_items ADD COLUMN IF NOT EXISTS length DOUBLE PRECISION NOT NULL DEFAULT 1",
+            "ALTER TABLE bill_items ADD COLUMN IF NOT EXISTS breadth DOUBLE PRECISION NOT NULL DEFAULT 1",
+            "ALTER TABLE bill_items ADD COLUMN IF NOT EXISTS height DOUBLE PRECISION NOT NULL DEFAULT 1",
+            "ALTER TABLE bill_items ADD COLUMN IF NOT EXISTS remark TEXT",
+            "ALTER TABLE payments ADD COLUMN IF NOT EXISTS bill_id VARCHAR(36) REFERENCES bills(id) ON DELETE SET NULL",
+            "CREATE INDEX IF NOT EXISTS ix_bills_user_created ON bills (user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_bills_client_id ON bills (client_id)",
+            "CREATE INDEX IF NOT EXISTS ix_bills_project_id ON bills (project_id)",
+            "CREATE INDEX IF NOT EXISTS ix_bill_items_bill_id ON bill_items (bill_id)",
+            "CREATE INDEX IF NOT EXISTS ix_payments_bill_id ON payments (bill_id)",
+        ]:
+            await conn.execute(text(ddl))
         print("Database migrations completed successfully.")
 
 async def add_unique_payment_index():

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, Float, Integer, ForeignKey, DateTime, Text, Boolean, desc
+from sqlalchemy import Column, String, Float, Integer, ForeignKey, DateTime, Date, Text, Boolean, UniqueConstraint, desc
 from sqlalchemy.orm import relationship
 from db import Base
 
@@ -68,6 +68,38 @@ class User(Base):
         self._prof(create=True).general_terms = value
 
     @property
+    def billing_terms(self):
+        return self.profile.billing_terms if self.profile else None
+
+    @billing_terms.setter
+    def billing_terms(self, value):
+        self._prof(create=True).billing_terms = value
+
+    @property
+    def signature(self):
+        return self.profile.signature if self.profile else None
+
+    @signature.setter
+    def signature(self, value):
+        self._prof(create=True).signature = value
+
+    @property
+    def stamp(self):
+        return self.profile.stamp if self.profile else None
+
+    @stamp.setter
+    def stamp(self, value):
+        self._prof(create=True).stamp = value
+
+    @property
+    def billing_template(self):
+        return (self.profile.billing_template if self.profile else None) or "modern"
+
+    @billing_template.setter
+    def billing_template(self, value):
+        self._prof(create=True).billing_template = value
+
+    @property
     def payment_status(self):
         return self.subscription.payment_status if self.subscription and self.subscription.payment_status else "unpaid"
 
@@ -107,6 +139,10 @@ class UserProfile(Base):
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     company_logo = Column(Text, nullable=True)
     general_terms = Column(Text, nullable=True)
+    billing_template = Column(String(20), nullable=False, default="modern", server_default="modern")
+    billing_terms = Column(Text, nullable=True)   # terms printed on bills (separate from quotation terms)
+    signature = Column(Text, nullable=True)       # base64 data URI, printed on bills
+    stamp = Column(Text, nullable=True)           # base64 data URI, printed on bills
 
     user = relationship("User", back_populates="profile")
 
@@ -162,7 +198,7 @@ class Project(Base):
     name = Column(String(255), nullable=False)
     site_address = Column(Text, nullable=True)
     budget = Column(Float, nullable=False)
-    status = Column(String(50), nullable=False) # 'Planning', 'Design Phase', 'Execution', 'Completed', 'On Hold'
+    status = Column(String(50), nullable=False) # 'Planning', 'Design Phase', 'Execution', 'Completed', 'On Hold', 'Cancelled'
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="projects")
@@ -272,9 +308,63 @@ class Payment(Base):
     payment_method = Column(String(50), nullable=False) # 'Bank Transfer', 'Cash', 'Cheque', 'UPI', 'Other'
     transaction_id = Column(String(100), nullable=True)
     notes = Column(Text, nullable=True)
+    # Optional link to the bill this payment settles (kept if the bill is deleted).
+    bill_id = Column(String(36), ForeignKey("bills.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="payments")
+    bill = relationship("Bill", back_populates="payments")
+
+
+class Bill(Base):
+    """A customer bill. Totals are always computed on the server from `items`."""
+    __tablename__ = "bills"
+    __table_args__ = (UniqueConstraint("user_id", "bill_number", name="ux_bills_user_number"),)
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_id = Column(String(36), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    bill_number = Column(String(30), nullable=False)
+    bill_date = Column(Date, nullable=False)
+    due_date = Column(Date, nullable=True)
+    status = Column(String(20), nullable=False, default="draft")  # 'draft' | 'generated'
+    template = Column(String(20), nullable=False, default="modern")  # snapshot taken when generated
+    customer_gstin = Column(String(20), nullable=True)
+    notes = Column(Text, nullable=True)
+    subtotal = Column(Float, nullable=False, default=0.0)
+    tax_amount = Column(Float, nullable=False, default=0.0)
+    discount_amount = Column(Float, nullable=False, default=0.0)
+    grand_total = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")
+    project = relationship("Project")
+    items = relationship(
+        "BillItem", back_populates="bill", cascade="all, delete-orphan",
+        order_by="BillItem.position", lazy="selectin",
+    )
+    payments = relationship("Payment", back_populates="bill")
+
+
+class BillItem(Base):
+    __tablename__ = "bill_items"
+
+    id = Column(String(36), primary_key=True)
+    bill_id = Column(String(36), ForeignKey("bills.id", ondelete="CASCADE"), nullable=False, index=True)
+    position = Column(Integer, nullable=False, default=0)
+    description = Column(String(200), nullable=False)
+    qty = Column(Float, nullable=False)
+    rate = Column(Float, nullable=False)
+    tax_percent = Column(Float, nullable=False, default=0.0)
+    amount = Column(Float, nullable=False)  # qty * measure * rate * (1 + tax/100)
+    pricing_type = Column(String(20), nullable=False, default="piece", server_default="piece")  # piece | sq_ft | running_ft
+    length = Column(Float, nullable=False, default=1.0, server_default="1")
+    breadth = Column(Float, nullable=False, default=1.0, server_default="1")
+    height = Column(Float, nullable=False, default=1.0, server_default="1")
+    remark = Column(Text, nullable=True)
+
+    bill = relationship("Bill", back_populates="items")
 
 
 class SubscriptionPayment(Base):

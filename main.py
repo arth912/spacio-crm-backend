@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from db import engine
-from routers import auth, users, clients, projects, catalog, quotations, payments
+from routers import auth, users, clients, projects, catalog, quotations, payments, billing
 
 app = FastAPI(
     title="decoCRM API Engine",
@@ -139,6 +139,7 @@ app.include_router(projects.router)
 app.include_router(catalog.router)
 app.include_router(quotations.router)
 app.include_router(payments.router)
+app.include_router(billing.router)
 
 @app.get("/")
 async def root():

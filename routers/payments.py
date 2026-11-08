@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from db import get_db
 import models
@@ -24,6 +24,23 @@ async def create_payment(
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    if payment_data.bill_id:
+        # Row-lock the bill so two concurrent payments cannot both pass the balance check.
+        bill = (await db.execute(
+            select(models.Bill)
+            .where(models.Bill.id == payment_data.bill_id, models.Bill.user_id == current_user_id)
+            .with_for_update()
+        )).scalars().first()
+        if not bill or bill.project_id != payment_data.project_id:
+            raise HTTPException(status_code=404, detail="Bill not found for this project")
+        if bill.status != "generated":
+            raise HTTPException(status_code=409, detail="Generate the bill before recording a payment against it")
+        paid = (await db.execute(
+            select(func.coalesce(func.sum(models.Payment.amount), 0.0)).where(models.Payment.bill_id == bill.id)
+        )).scalar()
+        if payment_data.amount > round(bill.grand_total - float(paid), 2) + 0.005:
+            raise HTTPException(status_code=400, detail="Payment is more than the balance due on this bill")
+
     p_date = payment_data.payment_date.replace(tzinfo=None) if payment_data.payment_date else datetime.utcnow()
     new_payment = models.Payment(
         id=str(uuid.uuid4()),
@@ -32,7 +49,8 @@ async def create_payment(
         payment_date=p_date,
         payment_method=payment_data.payment_method,
         transaction_id=payment_data.transaction_id,
-        notes=payment_data.notes
+        notes=payment_data.notes,
+        bill_id=payment_data.bill_id or None,
     )
     db.add(new_payment)
     await db.commit()
