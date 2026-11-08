@@ -1,8 +1,9 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import date, datetime
 
 LOGO_MAX = 1_500_000  # ~1.1 MB image as base64
+BILLING_TEMPLATE_PATTERN = "^(classic|modern|minimal|professional)$"
 
 # --- AUTH SCHEMAS ---
 class UserRegister(BaseModel):
@@ -26,6 +27,10 @@ class UserResponse(BaseModel):
     phone: Optional[str] = None
     company_logo: Optional[str] = None
     general_terms: Optional[str] = None
+    billing_terms: Optional[str] = None
+    signature: Optional[str] = None
+    stamp: Optional[str] = None
+    billing_template: str = "modern"
     is_approved: bool
     created_at: datetime
     access_start: Optional[datetime] = None
@@ -96,6 +101,10 @@ class UserProfileUpdate(BaseModel):
     phone: Optional[str] = Field(None, max_length=20)
     company_logo: Optional[str] = Field(None, max_length=LOGO_MAX)
     general_terms: Optional[str] = Field(None, max_length=20000)
+    billing_terms: Optional[str] = Field(None, max_length=20000)
+    signature: Optional[str] = Field(None, max_length=LOGO_MAX)
+    stamp: Optional[str] = Field(None, max_length=LOGO_MAX)
+    billing_template: Optional[str] = Field(None, pattern=BILLING_TEMPLATE_PATTERN)
     new_password: Optional[str] = Field(None, min_length=6, max_length=72)
 
 class TokenResponse(BaseModel):
@@ -139,14 +148,14 @@ class ProjectCreate(BaseModel):
     name: str
     site_address: Optional[str] = None
     budget: float
-    status: str = Field("Draft", pattern="^(Draft|Planning|Designing|Design Phase|Start Working|Execution|Completed|On Hold)$")
+    status: str = Field("Draft", pattern="^(Draft|Planning|Designing|Design Phase|Start Working|Execution|Completed|On Hold|Cancelled)$")
 
 class ProjectUpdate(BaseModel):
     client_id: Optional[str] = None
     name: str
     site_address: Optional[str] = None
     budget: float
-    status: str = Field("Draft", pattern="^(Draft|Planning|Designing|Design Phase|Start Working|Execution|Completed|On Hold)$")
+    status: str = Field("Draft", pattern="^(Draft|Planning|Designing|Design Phase|Start Working|Execution|Completed|On Hold|Cancelled)$")
 
 class ProjectResponse(BaseModel):
     id: str
@@ -306,6 +315,7 @@ class PaymentCreate(BaseModel):
     transaction_id: Optional[str] = None
     notes: Optional[str] = None
     payment_date: Optional[datetime] = None
+    bill_id: Optional[str] = Field(None, max_length=36)
 
 class PaymentResponse(BaseModel):
     id: str
@@ -316,10 +326,68 @@ class PaymentResponse(BaseModel):
     payment_method: str
     transaction_id: Optional[str] = None
     notes: Optional[str] = None
+    bill_id: Optional[str] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+# --- BILLING SCHEMAS ---
+MAX_BILL_ITEMS = 100
+
+class BillItemIn(BaseModel):
+    description: str = Field(..., min_length=1, max_length=200)
+    qty: float = Field(..., gt=0, le=1_000_000)
+    rate: float = Field(..., ge=0, le=100_000_000)
+    tax_percent: float = Field(0.0, ge=0, le=100)
+    # Same three pricing modes as estimations. `description` holds the item name.
+    pricing_type: str = Field("piece", pattern="^(piece|sq_ft|running_ft)$")
+    length: float = Field(1.0, ge=0, le=1_000_000)
+    breadth: float = Field(1.0, ge=0, le=1_000_000)
+    height: float = Field(1.0, ge=0, le=1_000_000)
+    remark: Optional[str] = Field(None, max_length=500)
+
+class BillItemOut(BillItemIn):
+    id: str
+    position: int
+    amount: float
+
+    class Config:
+        from_attributes = True
+
+class BillWrite(BaseModel):
+    client_id: str = Field(..., max_length=36)
+    project_id: str = Field(..., max_length=36)
+    bill_date: date
+    due_date: Optional[date] = None
+    customer_gstin: Optional[str] = Field(None, max_length=20, pattern=r"^[0-9A-Za-z]*$")
+    notes: Optional[str] = Field(None, max_length=2000)
+    discount_amount: float = Field(0.0, ge=0, le=100_000_000)
+    items: List[BillItemIn] = Field(..., min_length=1, max_length=MAX_BILL_ITEMS)
+
+class BillResponse(BaseModel):
+    id: str
+    bill_number: str
+    client_id: str
+    client_name: Optional[str] = None
+    project_id: str
+    project_name: Optional[str] = None
+    bill_date: date
+    due_date: Optional[date] = None
+    status: str
+    template: str
+    customer_gstin: Optional[str] = None
+    notes: Optional[str] = None
+    subtotal: float
+    tax_amount: float
+    discount_amount: float
+    grand_total: float
+    paid_amount: float = 0.0
+    balance: float = 0.0
+    payment_status: str = "unpaid"  # unpaid | partial | paid
+    created_at: datetime
+    items: List[BillItemOut] = []
 
 
 # --- SUBSCRIPTION PAYMENT SCHEMAS ---

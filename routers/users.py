@@ -44,6 +44,14 @@ async def update_profile(
         user.company_logo = profile_data.company_logo
     if profile_data.general_terms is not None:
         user.general_terms = profile_data.general_terms
+    if profile_data.billing_terms is not None:
+        user.billing_terms = profile_data.billing_terms
+    if profile_data.signature is not None:
+        user.signature = profile_data.signature
+    if profile_data.stamp is not None:
+        user.stamp = profile_data.stamp
+    if profile_data.billing_template is not None:
+        user.billing_template = profile_data.billing_template
         
     password_changed = False
     if profile_data.new_password:

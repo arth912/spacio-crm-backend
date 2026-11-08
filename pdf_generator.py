@@ -636,10 +636,9 @@ _PDF_CACHE_MAX = 32
 _PDF_CACHE_LOCK = threading.Lock()
 
 
-def generate_quotation_pdf(quotation_dict: dict) -> bytes:
-    """Render to PDF bytes, reusing a recent result when the rendered HTML is identical
-    (re-downloading an unchanged quotation is then instant)."""
-    html_content = generate_quotation_html(quotation_dict, weasyprint_failed=False)
+def render_pdf_cached(html_content: str) -> bytes:
+    """Render HTML to PDF, reusing a recent result when the HTML is identical
+    (re-downloading an unchanged document is then instant). Shared by quotations and bills."""
     key = hashlib.sha256(html_content.encode("utf-8")).hexdigest()
     with _PDF_CACHE_LOCK:
         cached = _PDF_CACHE.get(key)
@@ -652,6 +651,11 @@ def generate_quotation_pdf(quotation_dict: dict) -> bytes:
         while len(_PDF_CACHE) > _PDF_CACHE_MAX:
             _PDF_CACHE.popitem(last=False)
     return pdf
+
+
+def generate_quotation_pdf(quotation_dict: dict) -> bytes:
+    """Render a quotation to PDF bytes."""
+    return render_pdf_cached(generate_quotation_html(quotation_dict, weasyprint_failed=False))
 
 
 def _render_pdf(html_content: str) -> bytes:
