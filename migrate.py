@@ -2,6 +2,64 @@ import asyncio
 from sqlalchemy import text
 from db import engine
 
+async def promote_user_catalogues_to_general(conn):
+    """One-time: merge every user's private catalogue into the general (user_id NULL) catalogue.
+
+    Categories are merged by name and items by (category, name). The first row found becomes the
+    general row; each owner's rate is kept as a private override in user_item_rates, and
+    quotation_items are re-pointed at the surviving rows. Guarded by a flag so it runs once.
+    """
+    await conn.execute(text("CREATE TABLE IF NOT EXISTS schema_flags (name VARCHAR(100) PRIMARY KEY)"))
+    done = (await conn.execute(text("SELECT 1 FROM schema_flags WHERE name = 'general_catalogue_v1'"))).first()
+    if done:
+        return
+    import uuid
+    cats = (await conn.execute(text("SELECT id, name FROM categories WHERE user_id IS NOT NULL ORDER BY created_at, id"))).all()
+    cat_canon, cat_map = {}, {}
+    for cid, name in cats:
+        key = (name or "").strip().lower()
+        cat_canon.setdefault(key, cid)
+        cat_map[cid] = cat_canon[key]
+    items = (await conn.execute(text(
+        "SELECT id, category_id, name, base_rate, labor_cost, user_id FROM items WHERE user_id IS NOT NULL ORDER BY created_at, id"))).all()
+    item_canon, item_map, rates = {}, {}, []
+    for iid, cat_id, name, rate, labor, owner in items:
+        ccat = cat_map.get(cat_id, cat_id)
+        key = (ccat, (name or "").strip().lower())
+        item_canon.setdefault(key, iid)
+        item_map[iid] = (item_canon[key], ccat)
+        rates.append((owner, item_canon[key], rate, labor))
+    # private rates first (needs owners), then re-point references, then drop duplicates
+    seen = set()
+    for owner, item_id, rate, labor in rates:
+        if (owner, item_id) in seen:
+            continue
+        seen.add((owner, item_id))
+        await conn.execute(text(
+            "INSERT INTO user_item_rates (id, user_id, item_id, base_rate, labor_cost) "
+            "SELECT CAST(:id AS VARCHAR), CAST(:u AS VARCHAR), CAST(:i AS VARCHAR), CAST(:r AS DOUBLE PRECISION), CAST(:l AS DOUBLE PRECISION) "
+            "WHERE NOT EXISTS (SELECT 1 FROM user_item_rates WHERE user_id = CAST(:u AS VARCHAR) AND item_id = CAST(:i AS VARCHAR))"),
+            {"id": str(uuid.uuid4()), "u": owner, "i": item_id, "r": rate, "l": labor or 0.0})
+    for iid, (canon_id, ccat) in item_map.items():
+        if canon_id != iid:
+            await conn.execute(text("UPDATE quotation_items SET item_id = :c, category_id = :cc WHERE item_id = :i"),
+                               {"c": canon_id, "cc": ccat, "i": iid})
+    for cid, canon_id in cat_map.items():
+        if canon_id != cid:
+            await conn.execute(text("UPDATE quotation_items SET category_id = :c WHERE category_id = :i"), {"c": canon_id, "i": cid})
+    for iid, (canon_id, ccat) in item_map.items():
+        if canon_id != iid:
+            await conn.execute(text("DELETE FROM items WHERE id = :i"), {"i": iid})
+        else:
+            await conn.execute(text("UPDATE items SET category_id = :cc, user_id = NULL WHERE id = :i"), {"cc": ccat, "i": iid})
+    for cid, canon_id in cat_map.items():
+        if canon_id != cid:
+            await conn.execute(text("DELETE FROM categories WHERE id = :i"), {"i": cid})
+        else:
+            await conn.execute(text("UPDATE categories SET user_id = NULL WHERE id = :i"), {"i": cid})
+    await conn.execute(text("INSERT INTO schema_flags (name) VALUES ('general_catalogue_v1')"))
+    print(f"General catalogue: promoted {len(set(cat_map.values()))} categories, {len(set(v[0] for v in item_map.values()))} items.")
+
 async def run_db_migrations():
     async with engine.begin() as conn:
         # NOTE: the email-verification / password-reset columns that used to be added to `users` here
@@ -31,6 +89,19 @@ async def run_db_migrations():
             # name uniqueness is now per owner instead of global
             "ALTER TABLE categories DROP CONSTRAINT IF EXISTS categories_name_key",
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_categories_owner_name ON categories (COALESCE(user_id, ''), lower(name))",
+            # general catalogue (user_id NULL) managed by Admin + per-user private rate overrides
+            "ALTER TABLE categories ALTER COLUMN user_id DROP NOT NULL",
+            "ALTER TABLE items ALTER COLUMN user_id DROP NOT NULL",
+            """CREATE TABLE IF NOT EXISTS user_item_rates (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                item_id VARCHAR(36) NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                base_rate DOUBLE PRECISION NOT NULL,
+                labor_cost DOUBLE PRECISION DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT now()
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_item_rates ON user_item_rates (user_id, item_id)",
+            "ALTER TABLE user_item_rates ENABLE ROW LEVEL SECURITY",
         ]:
             await conn.execute(text(ddl))
         # Billing: template choice lives on the profile; payments can optionally settle a bill
@@ -39,6 +110,7 @@ async def run_db_migrations():
             "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS billing_terms TEXT",
             "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS signature TEXT",
             "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS stamp TEXT",
+            "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS tour_completed BOOLEAN NOT NULL DEFAULT FALSE",
             """CREATE TABLE IF NOT EXISTS bills (
                 id VARCHAR(36) PRIMARY KEY,
                 user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -84,6 +156,18 @@ async def run_db_migrations():
             "ALTER TABLE bill_items ENABLE ROW LEVEL SECURITY",
         ]:
             await conn.execute(text(ddl))
+        # Subscription status: expired non Admin/Sales users are deactivated automatically (expiry.py)
+        for ddl in [
+            "ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'",
+            """UPDATE user_subscriptions s SET status = 'deactivated'
+               FROM users u
+               WHERE u.id = s.user_id AND u.role NOT IN ('Admin', 'Sales')
+                 AND s.access_end IS NOT NULL AND s.access_end < (now() at time zone 'utc')
+                 AND s.status = 'active'""",
+        ]:
+            await conn.execute(text(ddl))
+        await promote_user_catalogues_to_general(conn)
+        await conn.execute(text("ALTER TABLE schema_flags ENABLE ROW LEVEL SECURITY"))
         print("Database migrations completed successfully.")
 
 async def add_unique_payment_index():

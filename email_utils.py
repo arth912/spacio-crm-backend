@@ -4,6 +4,8 @@ import smtplib
 import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -502,9 +504,10 @@ def get_payment_confirmation_html(
     """
 
 
-async def send_email(to_email: str, subject: str, body_html: str):
+async def send_email(to_email: str, subject: str, body_html: str, attachments: list = None):
     """
     Sends an email using the configured SMTP server.
+    attachments: optional list of (bytes, mime_type, filename), e.g. (data, "image/jpeg", "screenshot.jpg").
     If no SMTP_PASSWORD is set, it outputs the email content to stdout for testing.
     """
     if not SMTP_PASSWORD:
@@ -520,13 +523,20 @@ async def send_email(to_email: str, subject: str, body_html: str):
         return
 
     # Create message container
-    msg = MIMEMultipart('alternative')
+    msg = MIMEMultipart('mixed' if attachments else 'alternative')
     msg['Subject'] = subject
     msg['From'] = SMTP_FROM
     msg['To'] = to_email
 
     # Attach HTML content
     msg.attach(MIMEText(body_html, 'html'))
+    for data, mime_type, filename in (attachments or []):
+        maintype, _, subtype = mime_type.partition('/')
+        part = MIMEBase(maintype or 'application', subtype or 'octet-stream')
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', 'attachment', filename=filename)
+        msg.attach(part)
 
     try:
         # Check port to choose connection method (465 SSL vs 587 StartTLS)
