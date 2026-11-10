@@ -210,6 +210,9 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
             }
         )
 
+    if needs_subscription and user.status == "deactivated":
+        raise HTTPException(status_code=403, detail="Your account has been deactivated. Please contact an administrator.")
+
     token = await _issue_session(user, db)
     return {"access_token": token, "token_type": "bearer"}
 
@@ -428,11 +431,13 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
                 selected_plan=payload.selected_plan or "monthly",
                 access_start=now,
                 access_end=access_end,
+                status="active",
             ),
         )
         db.add(user)
     else:
         user.payment_status = "paid"
+        user.status = "active"
         user.is_approved = True
         user.is_email_verified = True
         

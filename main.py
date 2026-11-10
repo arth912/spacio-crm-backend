@@ -44,7 +44,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from db import engine
-from routers import auth, users, clients, projects, catalog, quotations, payments, billing
+from expiry import expiry_loop
+from routers import auth, users, clients, projects, catalog, quotations, payments, billing, feedback
 
 app = FastAPI(
     title="decoCRM API Engine",
@@ -86,13 +87,15 @@ async def startup_event():
         print(f"❌ Database connection failed: {e}")
         logger.error(f"Database connection failed during startup: {e}")
     app.state.keepalive_task = asyncio.create_task(_keepalive_loop())
+    app.state.expiry_task = asyncio.create_task(expiry_loop())
     print("=" * 50)
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    task = getattr(app.state, "keepalive_task", None)
-    if task:
-        task.cancel()
+    for name in ("keepalive_task", "expiry_task"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
     await engine.dispose()
 
 # --- Security & performance middleware ---
@@ -140,6 +143,7 @@ app.include_router(catalog.router)
 app.include_router(quotations.router)
 app.include_router(payments.router)
 app.include_router(billing.router)
+app.include_router(feedback.router)
 
 @app.get("/")
 async def root():

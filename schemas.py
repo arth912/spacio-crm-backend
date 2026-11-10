@@ -31,16 +31,21 @@ class UserResponse(BaseModel):
     signature: Optional[str] = None
     stamp: Optional[str] = None
     billing_template: str = "modern"
+    tour_completed: bool = False
     is_approved: bool
     created_at: datetime
     access_start: Optional[datetime] = None
     access_end: Optional[datetime] = None
     payment_status: str
     selected_plan: str
+    status: str = "active"
 
 
     class Config:
         from_attributes = True
+
+class TourStatusUpdate(BaseModel):
+    completed: bool = True
 
 class UserListItem(BaseModel):
     """Admin list row: omits the large company_logo / general_terms (fetched per user on demand)."""
@@ -55,6 +60,10 @@ class UserListItem(BaseModel):
     access_end: Optional[datetime] = None
     payment_status: str
     selected_plan: str
+    status: str = "active"
+
+class UserStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(active|deactivated)$")
 
 class RegisterResponse(BaseModel):
     message: str
@@ -188,6 +197,7 @@ class RoomResponse(BaseModel):
 class CategoryResponse(BaseModel):
     id: str
     name: str
+    is_general: bool = False
     created_at: datetime
 
     class Config:
@@ -195,6 +205,13 @@ class CategoryResponse(BaseModel):
 
 class CategoryCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
+
+class CategoryUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+class MyRateUpdate(BaseModel):
+    base_rate: float = Field(..., ge=0.0, le=100_000_000)
+    labor_cost: float = Field(0.0, ge=0.0, le=100_000_000)
 
 class ItemResponse(BaseModel):
     id: str
@@ -207,6 +224,8 @@ class ItemResponse(BaseModel):
     labor_cost: float
     material: Optional[str] = None
     dimensions: Optional[str] = None
+    is_general: bool = False
+    has_custom_rate: bool = False
     created_at: datetime
 
     class Config:

@@ -92,6 +92,14 @@ class User(Base):
         self._prof(create=True).stamp = value
 
     @property
+    def tour_completed(self):
+        return bool(self.profile.tour_completed) if self.profile else False
+
+    @tour_completed.setter
+    def tour_completed(self, value):
+        self._prof(create=True).tour_completed = bool(value)
+
+    @property
     def billing_template(self):
         return (self.profile.billing_template if self.profile else None) or "modern"
 
@@ -131,6 +139,14 @@ class User(Base):
     def access_end(self, value):
         self._sub(create=True).access_end = value
 
+    @property
+    def status(self):
+        return self.subscription.status if self.subscription and self.subscription.status else "active"
+
+    @status.setter
+    def status(self, value):
+        self._sub(create=True).status = value
+
 
 class UserProfile(Base):
     """Company branding shown on quotation PDFs (large base64 logo + terms)."""
@@ -143,6 +159,7 @@ class UserProfile(Base):
     billing_terms = Column(Text, nullable=True)   # terms printed on bills (separate from quotation terms)
     signature = Column(Text, nullable=True)       # base64 data URI, printed on bills
     stamp = Column(Text, nullable=True)           # base64 data URI, printed on bills
+    tour_completed = Column(Boolean, nullable=False, default=False, server_default="false")  # onboarding tour finished/skipped
 
     user = relationship("User", back_populates="profile")
 
@@ -157,6 +174,8 @@ class UserSubscription(Base):
     selected_plan = Column(String(50), default="monthly", nullable=False)
     access_start = Column(DateTime(timezone=False), nullable=True)
     access_end = Column(DateTime(timezone=False), nullable=True)
+    # 'active' | 'deactivated'. Set automatically when access_end passes (see expiry.py) or by an admin.
+    status = Column(String(20), default="active", nullable=False, server_default="active")
 
     user = relationship("User", back_populates="subscription")
 
@@ -222,8 +241,8 @@ class Category(Base):
 
     id = Column(String(36), primary_key=True)
     name = Column(String(255), nullable=False)
-    # owner; every user has a private catalogue
-    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # owner; NULL = general catalogue managed by Admin, shared with every user
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     items = relationship("Item", back_populates="category", cascade="all, delete-orphan")
@@ -242,11 +261,23 @@ class Item(Base):
     labor_cost = Column(Float, default=0.0)
     material = Column(Text, nullable=True)
     dimensions = Column(String(255), nullable=True)
-    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # NULL = general catalogue item (Admin-managed)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     category = relationship("Category", back_populates="items")
     quotation_items = relationship("QuotationItem", back_populates="item")
+
+class UserItemRate(Base):
+    """A user's private rate override for an item of the general catalogue."""
+    __tablename__ = "user_item_rates"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(String(36), ForeignKey("items.id", ondelete="CASCADE"), nullable=False, index=True)
+    base_rate = Column(Float, nullable=False)
+    labor_cost = Column(Float, default=0.0)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 class Quotation(Base):
     __tablename__ = "quotations"

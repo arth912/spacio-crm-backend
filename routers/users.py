@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,6 +68,23 @@ async def update_profile(
     return user
 
 
+@router.put("/auth/tour", response_model=schemas.UserResponse)
+async def update_tour_status(
+    payload: schemas.TourStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: str = Depends(require_authenticated_user_id),
+):
+    """Mark the onboarding tour as seen (finished or skipped)."""
+    user = (await db.execute(select(models.User).where(models.User.id == current_user_id))).scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.tour_completed = payload.completed
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
 # --- ADMIN USER MANAGEMENT ENDPOINTS ---
 async def _require_admin(db: AsyncSession, user_id: str) -> None:
     """Admin check that reads only role + is_approved (not the whole user row incl. logo)."""
@@ -87,7 +105,8 @@ async def get_all_users(
         select(U.id, U.name, U.email, U.role, U.phone, U.is_approved, U.created_at,
                S.access_start, S.access_end,
                func.coalesce(S.payment_status, "unpaid").label("payment_status"),
-               func.coalesce(S.selected_plan, "monthly").label("selected_plan"))
+               func.coalesce(S.selected_plan, "monthly").label("selected_plan"),
+               func.coalesce(S.status, "active").label("status"))
         .outerjoin(S, S.user_id == U.id)
         .order_by(desc(U.created_at))
     )
@@ -164,10 +183,37 @@ async def update_user_role(
         user.role = role_data.role
         user.access_start = role_data.access_start.replace(tzinfo=None) if role_data.access_start is not None else None
         user.access_end = role_data.access_end.replace(tzinfo=None) if role_data.access_end is not None else None
+        # Granting a future end date reactivates an expired / deactivated account.
+        if user.access_end is not None and user.access_end > datetime.utcnow():
+            user.status = "active"
 
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    return user
+
+@router.put("/users/{user_id}/status", response_model=schemas.UserResponse)
+async def update_user_status(
+    user_id: str,
+    body: schemas.UserStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user_id: str = Depends(require_authenticated_user_id)
+):
+    await _require_admin(db, current_user_id)
+    if user_id == current_user_id:
+        raise HTTPException(status_code=400, detail="Cannot change your own status")
+
+    user = (await db.execute(select(models.User).where(models.User.id == user_id))).scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.status = body.status
+    if body.status == "deactivated":
+        user.token_version = (user.token_version or 0) + 1  # sign the user out everywhere
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    clear_cached_token_version(user.id)
     return user
 
 @router.delete("/users/{user_id}")

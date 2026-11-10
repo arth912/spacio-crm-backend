@@ -5,7 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, or_
 
 from db import get_db
 import models
@@ -155,9 +155,15 @@ async def create_quotation(
     if item_ids:
         items_res = await db.execute(select(models.Item).where(
             models.Item.id.in_(item_ids),
-            models.Item.user_id == current_user_id,
+            or_(models.Item.user_id == current_user_id, models.Item.user_id.is_(None)),
         ))
         master_items_map = {it.id: it for it in items_res.scalars().all()}
+        my_rates = {r.item_id: r for r in (await db.execute(
+            select(models.UserItemRate).where(
+                models.UserItemRate.user_id == current_user_id,
+                models.UserItemRate.item_id.in_(item_ids),
+            )
+        )).scalars().all()}
     
     room_ids = {i.room_id for i in q_data.items}
     if room_ids:
@@ -175,8 +181,11 @@ async def create_quotation(
             raise HTTPException(status_code=400, detail="Item does not belong to the given category")
             
         ptype = item_in.pricing_type if (item_in.pricing_type is not None and item_in.pricing_type != "") else master_item.pricing_type
-        brate = item_in.base_rate if item_in.base_rate is not None else master_item.base_rate
-        lcost = item_in.labor_cost if item_in.labor_cost is not None else master_item.labor_cost
+        my_rate = my_rates.get(master_item.id)
+        eff_rate = my_rate.base_rate if my_rate else master_item.base_rate
+        eff_labor = my_rate.labor_cost if my_rate else master_item.labor_cost
+        brate = item_in.base_rate if item_in.base_rate is not None else eff_rate
+        lcost = item_in.labor_cost if item_in.labor_cost is not None else eff_labor
 
         pricing_breakdown = calculate_item_price(
             base_rate=brate,

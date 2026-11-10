@@ -71,24 +71,35 @@ def create_access_token(data: dict, token_version: int = 0) -> str:
     })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def set_cached_token_version(user_id: str, version: int) -> None:
-    _ver_cache[user_id] = (version, time.monotonic())
+def set_cached_token_version(user_id: str, version: int, blocked: bool = False) -> None:
+    _ver_cache[user_id] = (version, time.monotonic(), blocked)
 
 def clear_cached_token_version(user_id: str) -> None:
     _ver_cache.pop(user_id, None)
 
-async def _current_token_version(user_id: str, db: AsyncSession) -> Optional[int]:
+async def _current_token_version(user_id: str, db: AsyncSession) -> Optional[tuple]:
+    """Returns (token_version, blocked) or None if the user no longer exists.
+    blocked = a subscription-based user (not Admin/Sales) whose account is deactivated or whose
+    access period has ended. Cached together with the version, so no extra query per request."""
     cached = _ver_cache.get(user_id)
     if cached and time.monotonic() - cached[1] < _VER_TTL:
-        return cached[0]
-    result = await db.execute(select(models.User.token_version).where(models.User.id == user_id))
+        return cached[0], cached[2]
+    U, S = models.User, models.UserSubscription
+    result = await db.execute(
+        select(U.token_version, U.role, S.status, S.access_end)
+        .outerjoin(S, S.user_id == U.id)
+        .where(U.id == user_id)
+    )
     row = result.first()
     if row is None:
         _ver_cache.pop(user_id, None)
         return None
     version = row[0] or 0
-    set_cached_token_version(user_id, version)
-    return version
+    needs_subscription = row[1] not in ("Admin", "Sales")
+    expired = row[3] is not None and datetime.utcnow() > row[3]
+    blocked = needs_subscription and (row[2] == "deactivated" or expired)
+    set_cached_token_version(user_id, version, blocked)
+    return version, blocked
 
 _credentials_error = lambda detail="Could not validate credentials": HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -105,8 +116,10 @@ async def _authenticate(token: str, db: AsyncSession) -> dict:
     if not user_id:
         raise _credentials_error("Invalid authentication payload")
     current = await _current_token_version(user_id, db)
-    if current is None or payload.get("ver", 0) != current:
+    if current is None or payload.get("ver", 0) != current[0]:
         raise _credentials_error("Session expired or signed in on another device")
+    if current[1]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account_deactivated")
     return payload
 
 def _bearer_token(authorization: Optional[str]) -> str:
@@ -153,3 +166,18 @@ def hash_otp(code: str) -> str:
 
 def otp_matches(stored_hash: Optional[str], code: str) -> bool:
     return bool(stored_hash) and hmac.compare_digest(stored_hash, hash_otp(code))
+
+
+async def require_admin(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> str:
+    """Dependency: caller must be an approved Admin. Returns the user id."""
+    payload = await _authenticate(_bearer_token(authorization), db)
+    uid = payload["sub"]
+    row = (await db.execute(
+        select(models.User.role, models.User.is_approved).where(models.User.id == uid)
+    )).first()
+    if not row or row[0] != "Admin" or not row[1]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return uid
