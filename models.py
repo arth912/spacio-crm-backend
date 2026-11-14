@@ -420,7 +420,9 @@ class Coupon(Base):
     __tablename__ = "coupons"
 
     code            = Column(String(50), primary_key=True)            # stored upper-case
-    free_days       = Column(Integer, nullable=False, default=60)
+    free_days       = Column(Integer, nullable=True, default=60)       # subscription days granted; NULL = the plan's normal length (discount coupons only)
+    valid_from      = Column(DateTime, nullable=True)                  # NULL = valid immediately
+    discount_percent = Column(Integer, nullable=False, default=100)    # 100 = free (no payment); <100 = off the plan price
     max_redemptions = Column(Integer, nullable=True)                  # NULL = unlimited
     redeemed_count  = Column(Integer, nullable=False, default=0)
     valid_until     = Column(DateTime, nullable=True)                 # NULL = never expires

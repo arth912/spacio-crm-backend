@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from typing import List, Optional
 from datetime import date, datetime
 
@@ -75,6 +75,13 @@ class RegisterResponse(BaseModel):
 
 class CreateSubscriptionOrderRequest(BaseModel):
     user_id: str = Field(..., max_length=36)
+    selected_plan: str = Field("monthly", pattern="^(monthly|yearly)$")
+    coupon_code: Optional[str] = Field(None, max_length=50)
+
+
+class CouponValidateRequest(BaseModel):
+    user_id: str = Field(..., max_length=36)
+    code: str = Field(..., min_length=1, max_length=50)
     selected_plan: str = Field("monthly", pattern="^(monthly|yearly)$")
 
 
@@ -444,3 +451,35 @@ class PasswordResetConfirm(BaseModel):
     token: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
     new_password: str = Field(..., min_length=6, max_length=72)
 
+
+
+class CouponIn(BaseModel):
+    code: str = Field(..., min_length=3, max_length=50, pattern="^[A-Za-z0-9_-]+$")
+    discount_percent: int = Field(100, ge=1, le=100)
+    free_days: Optional[int] = Field(None, ge=1, le=3650)   # required when discount is 100%
+    valid_from: Optional[datetime] = None
+    valid_until: datetime
+    max_redemptions: Optional[int] = Field(None, ge=1)
+    is_active: bool = True
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.discount_percent >= 100 and not self.free_days:
+            raise ValueError("Free-access coupons need the number of subscription days.")
+        if self.valid_from and self.valid_until <= self.valid_from:
+            raise ValueError("Valid-until must be after valid-from.")
+        return self
+
+
+class CouponOut(BaseModel):
+    code: str
+    discount_percent: int
+    free_days: Optional[int] = None
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    max_redemptions: Optional[int] = None
+    redeemed_count: int = 0
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
