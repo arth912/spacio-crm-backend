@@ -166,6 +166,30 @@ async def run_db_migrations():
                  AND s.status = 'active'""",
         ]:
             await conn.execute(text(ddl))
+        # Coupons: free-access codes (default seed: SPACEIO60 = 60 days, all features, once per user)
+        for ddl in [
+            """CREATE TABLE IF NOT EXISTS coupons (
+                code VARCHAR(50) PRIMARY KEY,
+                free_days INTEGER NOT NULL DEFAULT 60,
+                max_redemptions INTEGER,
+                redeemed_count INTEGER NOT NULL DEFAULT 0,
+                valid_until TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT (now() at time zone 'utc')
+            )""",
+            """CREATE TABLE IF NOT EXISTS coupon_redemptions (
+                id VARCHAR(36) PRIMARY KEY,
+                code VARCHAR(50) NOT NULL REFERENCES coupons(code) ON DELETE CASCADE,
+                user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                redeemed_at TIMESTAMP DEFAULT (now() at time zone 'utc'),
+                UNIQUE (code, user_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS ix_coupon_redemptions_user ON coupon_redemptions (user_id)",
+            "INSERT INTO coupons (code, free_days) VALUES ('SPACEIO60', 60) ON CONFLICT (code) DO NOTHING",
+            "ALTER TABLE coupons ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE coupon_redemptions ENABLE ROW LEVEL SECURITY",
+        ]:
+            await conn.execute(text(ddl))
         await promote_user_catalogues_to_general(conn)
         await conn.execute(text("ALTER TABLE schema_flags ENABLE ROW LEVEL SECURITY"))
         print("Database migrations completed successfully.")

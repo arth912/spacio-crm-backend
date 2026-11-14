@@ -1,5 +1,9 @@
 import os
 import re
+import json
+import base64
+import asyncio
+import urllib.request
 import smtplib
 import logging
 from email.mime.multipart import MIMEMultipart
@@ -23,6 +27,53 @@ except ValueError:
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "")
+
+# Hostinger Mail API (optional). When HOSTINGER_MAIL_API_KEY is set it is used instead of SMTP.
+HOSTINGER_MAIL_API_KEY = os.getenv("HOSTINGER_MAIL_API_KEY", "")
+HOSTINGER_MAIL_MAILBOX_ID = os.getenv("HOSTINGER_MAIL_MAILBOX_ID", "")  # optional; auto-detected via /me
+HOSTINGER_MAIL_API_BASE = "https://api.mail.hostinger.com"
+_mailbox_id_cache = {"id": HOSTINGER_MAIL_MAILBOX_ID}
+
+
+def _hostinger_request(method: str, path: str, payload: dict = None):
+    """Blocking call to the Hostinger Mail API. Returns parsed JSON (or None for empty bodies)."""
+    req = urllib.request.Request(
+        HOSTINGER_MAIL_API_BASE + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {HOSTINGER_MAIL_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Cloudflare in front of the API rejects Python's default urllib User-Agent (error 1010)
+            "User-Agent": "SpaceIO-CRM/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        body = resp.read()
+        return json.loads(body) if body else None
+
+
+def _send_via_hostinger_api(to_email: str, subject: str, body_html: str, attachments: list = None):
+    if not _mailbox_id_cache["id"]:
+        me = _hostinger_request("GET", "/api/v1/me")
+        mailboxes = (me or {}).get("data", {}).get("mailboxes", [])
+        match = next((m for m in mailboxes if m.get("address") == SMTP_FROM), None) or (mailboxes[0] if mailboxes else None)
+        if not match:
+            raise RuntimeError("Hostinger Mail API token has no accessible mailbox")
+        _mailbox_id_cache["id"] = match["resourceId"]
+
+    payload = {"to": [to_email], "subject": subject, "html": body_html}
+    if attachments:
+        payload["attachments"] = [
+            {
+                "filename": filename,
+                "content": base64.b64encode(data).decode(),
+                "contentType": mime_type,
+            }
+            for data, mime_type, filename in attachments
+        ]
+    _hostinger_request("POST", f"/api/v1/mailboxes/{_mailbox_id_cache['id']}/send", payload)
 
 
 def get_verification_html(otp_code: str) -> str:
@@ -510,6 +561,16 @@ async def send_email(to_email: str, subject: str, body_html: str, attachments: l
     attachments: optional list of (bytes, mime_type, filename), e.g. (data, "image/jpeg", "screenshot.jpg").
     If no SMTP_PASSWORD is set, it outputs the email content to stdout for testing.
     """
+    if HOSTINGER_MAIL_API_KEY:
+        try:
+            await asyncio.to_thread(_send_via_hostinger_api, to_email, subject, body_html, attachments)
+            logger.info(f"Successfully sent email to {to_email} via Hostinger Mail API.")
+            return
+        except Exception as e:
+            logger.error(f"Hostinger Mail API send to {to_email} failed: {e}")
+            if not SMTP_PASSWORD:
+                return  # nothing else to fall back to; do not crash the request
+
     if not SMTP_PASSWORD:
         msg_parts = [
             "=" * 70,

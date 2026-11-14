@@ -413,3 +413,26 @@ class SubscriptionPayment(Base):
     created_at          = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="subscription_payments")
+
+
+class Coupon(Base):
+    """Redeemable code that grants free access time (all features) for `free_days`."""
+    __tablename__ = "coupons"
+
+    code            = Column(String(50), primary_key=True)            # stored upper-case
+    free_days       = Column(Integer, nullable=False, default=60)
+    max_redemptions = Column(Integer, nullable=True)                  # NULL = unlimited
+    redeemed_count  = Column(Integer, nullable=False, default=0)
+    valid_until     = Column(DateTime, nullable=True)                 # NULL = never expires
+    is_active       = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+
+class CouponRedemption(Base):
+    """One row per (coupon, user): a user can redeem a given coupon only once."""
+    __tablename__ = "coupon_redemptions"
+
+    id          = Column(String(36), primary_key=True)
+    code        = Column(String(50), ForeignKey("coupons.code", ondelete="CASCADE"), nullable=False)
+    user_id     = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    redeemed_at = Column(DateTime, default=datetime.utcnow)

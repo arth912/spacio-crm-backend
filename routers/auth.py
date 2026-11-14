@@ -502,6 +502,65 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
         "user": user
     }
 
+@router.post("/redeem-coupon", response_model=schemas.TokenResponse, dependencies=[Depends(rate_limit("redeem-coupon", 10, 600))])
+async def redeem_coupon(payload: schemas.CouponRedeemRequest, db: AsyncSession = Depends(get_db)):
+    """Grant free access (all features) for the coupon's free_days. Used from the payment-pending /
+    access-expired screen, where the caller holds the user_id returned by a correct-password login."""
+    invalid = HTTPException(status_code=400, detail="Invalid or expired coupon code.")
+    code = payload.code.strip().upper()
+
+    user = (await db.execute(select(models.User).where(models.User.id == payload.user_id))).scalars().first()
+    if not user or user.role in ("Admin", "Sales"):
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    now = datetime.utcnow()
+    # Row lock serialises concurrent redemptions so max_redemptions / once-per-user cannot be raced.
+    coupon = (await db.execute(
+        select(models.Coupon).where(models.Coupon.code == code).with_for_update()
+    )).scalars().first()
+    if (not coupon or not coupon.is_active
+            or (coupon.valid_until and now > coupon.valid_until)
+            or (coupon.max_redemptions is not None and coupon.redeemed_count >= coupon.max_redemptions)):
+        raise invalid
+
+    already = await db.execute(
+        select(models.CouponRedemption.id).where(
+            models.CouponRedemption.code == code, models.CouponRedemption.user_id == user.id
+        )
+    )
+    if already.first():
+        raise HTTPException(status_code=400, detail="You have already used this coupon.")
+
+    start_date = user.access_end if (user.access_end and user.access_end > now) else now
+    user.payment_status = "paid"
+    user.status = "active"
+    user.is_approved = True
+    user.access_start = now
+    user.access_end = start_date + timedelta(days=coupon.free_days)
+
+    coupon.redeemed_count = (coupon.redeemed_count or 0) + 1
+    redemption_id = str(uuid.uuid4())
+    db.add(models.CouponRedemption(id=redemption_id, code=code, user_id=user.id))
+    # Shows up in the user's payment history as a zero-amount entry
+    db.add(models.SubscriptionPayment(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        razorpay_order_id=None,
+        razorpay_payment_id=f"COUPON-{code}-{redemption_id[:8]}",
+        razorpay_signature=None,
+        plan=user.selected_plan,
+        amount=0.0,
+        access_start=user.access_start,
+        access_end=user.access_end,
+    ))
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    clear_cached_token_version(user.id)  # drop any cached "blocked" state
+
+    token = await _issue_session(user, db)
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
 @router.post("/forgot-password", dependencies=[Depends(rate_limit("forgot-password", 5, 600))])
 async def forgot_password(payload: schemas.PasswordResetRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     result = await db.execute(

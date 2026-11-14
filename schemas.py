@@ -94,6 +94,11 @@ class PaymentVerifyRequest(BaseModel):
 
 
 
+class CouponRedeemRequest(BaseModel):
+    user_id: str = Field(..., max_length=36)
+    code: str = Field(..., min_length=1, max_length=50)
+
+
 class UserRoleUpdate(BaseModel):
     role: str = Field(..., pattern="^(Admin|Designer|Sales)$")
     access_start: Optional[datetime] = None
