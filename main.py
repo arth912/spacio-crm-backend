@@ -45,7 +45,7 @@ from sqlalchemy import text
 
 from db import engine
 from expiry import expiry_loop
-from routers import auth, users, clients, projects, catalog, quotations, payments, billing, feedback
+from routers import auth, users, clients, projects, catalog, quotations, payments, billing, feedback, coupons
 
 app = FastAPI(
     title="decoCRM API Engine",
@@ -144,6 +144,7 @@ app.include_router(quotations.router)
 app.include_router(payments.router)
 app.include_router(billing.router)
 app.include_router(feedback.router)
+app.include_router(coupons.router)
 
 @app.get("/")
 async def root():

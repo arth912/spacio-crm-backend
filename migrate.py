@@ -185,7 +185,10 @@ async def run_db_migrations():
                 UNIQUE (code, user_id)
             )""",
             "CREATE INDEX IF NOT EXISTS ix_coupon_redemptions_user ON coupon_redemptions (user_id)",
-            "INSERT INTO coupons (code, free_days) VALUES ('SPACEIO60', 60) ON CONFLICT (code) DO NOTHING",
+            "ALTER TABLE coupons ADD COLUMN IF NOT EXISTS discount_percent INTEGER NOT NULL DEFAULT 100",
+            "ALTER TABLE coupons ADD COLUMN IF NOT EXISTS valid_from TIMESTAMP",
+            "ALTER TABLE coupons ALTER COLUMN free_days DROP NOT NULL",
+            "INSERT INTO coupons (code, free_days, discount_percent) VALUES ('SPACEIO60', 60, 100) ON CONFLICT (code) DO NOTHING",
             "ALTER TABLE coupons ENABLE ROW LEVEL SECURITY",
             "ALTER TABLE coupon_redemptions ENABLE ROW LEVEL SECURITY",
         ]:

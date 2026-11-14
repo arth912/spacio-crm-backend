@@ -142,22 +142,8 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
 
     if needs_subscription and user.payment_status == "unpaid":
         amount = 49900 if user.selected_plan == "monthly" else 499900
-        
-        if not razor_client:
-            raise HTTPException(
-                status_code=500,
-                detail="Razorpay payment gateway is not configured on the server. Cannot complete payment."
-            )
-        try:
-            order = await run_in_threadpool(razor_client.order.create, data={"amount": amount, "currency": "INR", "receipt": user.id})
-            razorpay_order_id = order.get("id")
-        except Exception as e:
-            logger.error(f"Razorpay Order creation on login error: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to generate payment order. Please try again."
-            )
-            
+        # No Razorpay order here: the client shows the coupon page first and the order is created
+        # (create-subscription-order) only if the user continues without a coupon.
         raise HTTPException(
             status_code=402,
             detail={
@@ -166,7 +152,7 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
                 "email": user.email,
                 "phone": user.phone,
                 "name": user.name,
-                "razorpay_order_id": razorpay_order_id,
+                "razorpay_order_id": None,
                 "razorpay_key_id": RAZORPAY_KEY_ID,
                 "amount": amount,
                 "plan": user.selected_plan
@@ -187,13 +173,6 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
         )
     if needs_subscription and user.access_end is not None and now > user.access_end:
         amount = 49900 if (user.selected_plan or "monthly") == "monthly" else 499900
-        razorpay_order_id = None
-        if razor_client:
-            try:
-                order = await run_in_threadpool(razor_client.order.create, data={"amount": amount, "currency": "INR", "receipt": user.id})
-                razorpay_order_id = order.get("id")
-            except Exception as e:
-                logger.error(f"Razorpay Order creation on expired login error: {e}")
         raise HTTPException(
             status_code=402,
             detail={
@@ -202,7 +181,7 @@ async def login(credentials: schemas.UserLogin, db: AsyncSession = Depends(get_d
                 "email": user.email,
                 "phone": user.phone,
                 "name": user.name,
-                "razorpay_order_id": razorpay_order_id,
+                "razorpay_order_id": None,
                 "razorpay_key_id": RAZORPAY_KEY_ID,
                 "amount": amount,
                 "plan": user.selected_plan or "monthly",
@@ -256,6 +235,58 @@ async def logout(
         set_cached_token_version(user.id, user.token_version)
     return {"message": "Signed out on all devices."}
 
+PLAN_AMOUNTS = {"monthly": 49900, "yearly": 499900}  # paise
+
+
+def _discounted_amount(plan: str, discount_percent: int) -> int:
+    base = PLAN_AMOUNTS.get(plan, PLAN_AMOUNTS["monthly"])
+    return max(0, base * (100 - max(0, min(100, discount_percent))) // 100)
+
+
+async def _get_valid_coupon(db: AsyncSession, code: str, user_id: str, lock: bool = False) -> models.Coupon:
+    """Return the coupon if it is usable by this user, else raise 400."""
+    code = code.strip().upper()
+    q = select(models.Coupon).where(models.Coupon.code == code)
+    if lock:
+        q = q.with_for_update()  # serialises concurrent redemptions (max_redemptions / once-per-user)
+    coupon = (await db.execute(q)).scalars().first()
+    now = datetime.utcnow()
+    if coupon and coupon.valid_from and now < coupon.valid_from:
+        raise HTTPException(status_code=400, detail="This coupon is not active yet.")
+    if coupon and coupon.valid_until and now > coupon.valid_until:
+        raise HTTPException(status_code=400, detail="This coupon has expired.")
+    if (not coupon or not coupon.is_active
+            or (coupon.valid_until and now > coupon.valid_until)
+            or (coupon.max_redemptions is not None and coupon.redeemed_count >= coupon.max_redemptions)):
+        raise HTTPException(status_code=400, detail="Invalid or expired coupon code.")
+    already = await db.execute(
+        select(models.CouponRedemption.id).where(
+            models.CouponRedemption.code == code, models.CouponRedemption.user_id == user_id
+        )
+    )
+    if already.first():
+        raise HTTPException(status_code=400, detail="You have already used this coupon.")
+    return coupon
+
+
+@router.post("/validate-coupon", dependencies=[Depends(rate_limit("validate-coupon", 20, 600))])
+async def validate_coupon(payload: schemas.CouponValidateRequest, db: AsyncSession = Depends(get_db)):
+    """Check a coupon and report its discount; nothing is redeemed or charged here."""
+    user = (await db.execute(select(models.User).where(models.User.id == payload.user_id))).scalars().first()
+    if not user or user.role in ("Admin", "Sales"):
+        raise HTTPException(status_code=404, detail="User not found.")
+    coupon = await _get_valid_coupon(db, payload.code, user.id)
+    pct = coupon.discount_percent if coupon.discount_percent is not None else 100
+    return {
+        "code": coupon.code,
+        "discount_percent": pct,
+        "is_free": pct >= 100,
+        "days": coupon.free_days or (30 if payload.selected_plan == "monthly" else 365),
+        "original_amount": PLAN_AMOUNTS[payload.selected_plan],
+        "amount": _discounted_amount(payload.selected_plan, pct),
+    }
+
+
 @router.post("/create-subscription-order", dependencies=[Depends(rate_limit("sub-order", 10, 600))])
 async def create_subscription_order(payload: schemas.CreateSubscriptionOrderRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(models.User).where(models.User.id == payload.user_id))
@@ -263,15 +294,26 @@ async def create_subscription_order(payload: schemas.CreateSubscriptionOrderRequ
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
         
-    amount = 49900 if payload.selected_plan == "monthly" else 499900
-    
+    amount = PLAN_AMOUNTS[payload.selected_plan]
+    notes = {}
+    if payload.coupon_code:
+        coupon = await _get_valid_coupon(db, payload.coupon_code, user.id)
+        pct = coupon.discount_percent if coupon.discount_percent is not None else 100
+        if pct >= 100:
+            raise HTTPException(status_code=400, detail="This coupon gives free access; apply it instead of paying.")
+        amount = _discounted_amount(payload.selected_plan, pct)
+        notes = {"coupon": coupon.code}
+
     if not razor_client:
         raise HTTPException(
             status_code=500,
             detail="Razorpay payment gateway is not configured on the server."
         )
     try:
-        order = razor_client.order.create(data={"amount": amount, "currency": "INR", "receipt": user.id})
+        order = await run_in_threadpool(
+            razor_client.order.create,
+            data={"amount": amount, "currency": "INR", "receipt": user.id, "notes": notes},
+        )
         razorpay_order_id = order.get("id")
     except Exception as e:
         logger.error(f"Razorpay Order creation error: {e}")
@@ -279,7 +321,7 @@ async def create_subscription_order(payload: schemas.CreateSubscriptionOrderRequ
             status_code=500,
             detail="Failed to generate payment order. Please try again."
         )
-        
+
     user.selected_plan = payload.selected_plan
     db.add(user)
     await db.commit()
@@ -294,6 +336,30 @@ async def create_subscription_order(payload: schemas.CreateSubscriptionOrderRequ
         "amount": amount,
         "plan": payload.selected_plan
     }
+
+@router.post("/resend-verification", dependencies=[Depends(rate_limit("resend-verification", 5, 600))])
+async def resend_verification(payload: schemas.PasswordResetRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    """Send a fresh verification OTP to an unverified account (e.g. after a login that returned email_unverified)."""
+    result = await db.execute(
+        select(models.User).options(_WITH_TOKENS, lazyload(models.User.profile)).where(models.User.email == payload.email)
+    )
+    user = result.scalars().first()
+    if user and not user.is_email_verified:
+        code = generate_otp()
+        t = _tokens(user)
+        t.verification_token = hash_otp(code)
+        t.verification_attempts = 0
+        t.verification_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        db.add(user)
+        await db.commit()
+        background_tasks.add_task(
+            send_email,
+            user.email,
+            "Verify Your Email Address — SpaceIO CRM",
+            get_verification_html(code)
+        )
+    # Same response either way so this can't be used to discover registered emails.
+    return {"message": "If the email is registered and unverified, a verification code has been sent."}
 
 @router.post("/verify-email", dependencies=[Depends(rate_limit("verify-email", 10, 600))])
 async def verify_email(payload: schemas.EmailVerifyRequest, db: AsyncSession = Depends(get_db)):
@@ -328,32 +394,19 @@ async def verify_email(payload: schemas.EmailVerifyRequest, db: AsyncSession = D
         db.add(user)
         await db.commit()
         
-    amount = 49900 if user.selected_plan == "monthly" else 499900
-    
-    if not razor_client:
-        raise HTTPException(
-            status_code=500,
-            detail="Razorpay payment gateway is not configured on the server. Please contact an administrator."
-        )
-    try:
-        order_data = {
-            "amount": amount,
-            "currency": "INR",
-            "receipt": user.id
-        }
-        order = razor_client.order.create(data=order_data)
-        razorpay_order_id = order.get("id")
-    except Exception as e:
-        logger.error(f"Razorpay Order creation error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create payment order with Razorpay. Please try again."
-        )
-        
+    plan = user.selected_plan or "monthly"
+    amount = 49900 if plan == "monthly" else 499900
+
+    # Razorpay is NOT called here. The client shows the coupon page next; the order is created
+    # (create-subscription-order) only if the user continues without a coupon.
     return {
-        "message": "Email verified successfully! Please complete your subscription payment.",
+        "message": "Email verified successfully! Apply a coupon code or continue to payment.",
         "user_id": user.id,
-        "razorpay_order_id": razorpay_order_id,
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "plan": plan,
+        "razorpay_order_id": None,
         "razorpay_key_id": RAZORPAY_KEY_ID,
         "amount": amount,
         "currency": "INR"
@@ -396,11 +449,18 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
         raise HTTPException(status_code=400, detail="Could not verify the payment order.")
     if order.get("receipt") != payload.user_id:
         raise HTTPException(status_code=400, detail="Payment does not belong to this account.")
-    plan_by_amount = {49900: "monthly", 499900: "yearly"}
-    verified_plan = plan_by_amount.get(order.get("amount"))
+    order_coupon = None
+    coupon_code = ((order.get("notes") or {}).get("coupon") or "").strip().upper()
+    if coupon_code:
+        order_coupon = await _get_valid_coupon(db, coupon_code, payload.user_id, lock=True)
+    pct = (order_coupon.discount_percent if order_coupon and order_coupon.discount_percent is not None else 0)
+    verified_plan = next(
+        (p for p in PLAN_AMOUNTS if _discounted_amount(p, pct) == order.get("amount")), None
+    )
     if not verified_plan:
         raise HTTPException(status_code=400, detail="Unrecognised payment amount.")
     payload.selected_plan = verified_plan
+    paid_rupees = (order.get("amount") or 0) / 100.0
 
     now = datetime.utcnow()
     
@@ -453,7 +513,9 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
         start_date = user.access_end if (user.access_end and user.access_end > now) else now
         user.access_start = now
         
-        if user.selected_plan == "monthly":
+        if order_coupon and order_coupon.free_days:
+            user.access_end = start_date + timedelta(days=order_coupon.free_days)
+        elif user.selected_plan == "monthly":
             user.access_end = start_date + timedelta(days=30)
         else:
             user.access_end = start_date + timedelta(days=365)
@@ -467,17 +529,20 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
         razorpay_payment_id=payload.razorpay_payment_id,
         razorpay_signature=payload.razorpay_signature,
         plan=user.selected_plan,
-        amount=499.0 if user.selected_plan == "monthly" else 4999.0,
+        amount=paid_rupees,
         access_start=user.access_start,
         access_end=user.access_end
     )
     db.add(sub_payment)
+    if order_coupon:
+        order_coupon.redeemed_count = (order_coupon.redeemed_count or 0) + 1
+        db.add(models.CouponRedemption(id=str(uuid.uuid4()), code=order_coupon.code, user_id=user.id))
     await db.commit()
     await db.refresh(user)
     
     try:
         access_end_str = user.access_end.strftime("%d %B %Y") if user.access_end else "N/A"
-        paid_amount = 499.0 if user.selected_plan == "monthly" else 4999.0
+        paid_amount = paid_rupees
         email_html = get_payment_confirmation_html(
             user_name=user.name,
             plan=user.selected_plan,
@@ -506,7 +571,6 @@ async def verify_payment(payload: schemas.PaymentVerifyRequest, background_tasks
 async def redeem_coupon(payload: schemas.CouponRedeemRequest, db: AsyncSession = Depends(get_db)):
     """Grant free access (all features) for the coupon's free_days. Used from the payment-pending /
     access-expired screen, where the caller holds the user_id returned by a correct-password login."""
-    invalid = HTTPException(status_code=400, detail="Invalid or expired coupon code.")
     code = payload.code.strip().upper()
 
     user = (await db.execute(select(models.User).where(models.User.id == payload.user_id))).scalars().first()
@@ -514,29 +578,16 @@ async def redeem_coupon(payload: schemas.CouponRedeemRequest, db: AsyncSession =
         raise HTTPException(status_code=404, detail="User not found.")
 
     now = datetime.utcnow()
-    # Row lock serialises concurrent redemptions so max_redemptions / once-per-user cannot be raced.
-    coupon = (await db.execute(
-        select(models.Coupon).where(models.Coupon.code == code).with_for_update()
-    )).scalars().first()
-    if (not coupon or not coupon.is_active
-            or (coupon.valid_until and now > coupon.valid_until)
-            or (coupon.max_redemptions is not None and coupon.redeemed_count >= coupon.max_redemptions)):
-        raise invalid
-
-    already = await db.execute(
-        select(models.CouponRedemption.id).where(
-            models.CouponRedemption.code == code, models.CouponRedemption.user_id == user.id
-        )
-    )
-    if already.first():
-        raise HTTPException(status_code=400, detail="You have already used this coupon.")
+    coupon = await _get_valid_coupon(db, code, user.id, lock=True)
+    if (coupon.discount_percent if coupon.discount_percent is not None else 100) < 100:
+        raise HTTPException(status_code=400, detail="This coupon is a discount; continue to payment to use it.")
 
     start_date = user.access_end if (user.access_end and user.access_end > now) else now
     user.payment_status = "paid"
     user.status = "active"
     user.is_approved = True
     user.access_start = now
-    user.access_end = start_date + timedelta(days=coupon.free_days)
+    user.access_end = start_date + timedelta(days=coupon.free_days or 60)
 
     coupon.redeemed_count = (coupon.redeemed_count or 0) + 1
     redemption_id = str(uuid.uuid4())
